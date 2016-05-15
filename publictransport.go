@@ -952,7 +952,7 @@ func (t *Transport) dialConn(cm ConnectMethod) (*PersistConn, error) {
 		cacheKey:   cm.key(),
 		reqch:      make(chan requestAndChan, 1),
 		writech:    make(chan writeRequest, 1),
-		closech:    make(chan struct{}),
+		Closech:    make(chan struct{}),
 		writeErrCh: make(chan error, 1),
 	}
 	tlsDial := t.DialTLS != nil && cm.targetScheme == "https" && cm.proxyURL == nil
@@ -1212,7 +1212,7 @@ type PersistConn struct {
 	bw       *bufio.Writer       // to conn
 	reqch    chan requestAndChan // written by roundTrip; read by readLoop
 	writech  chan writeRequest   // written by roundTrip; read by WriteLoop
-	closech  chan struct{}       // closed when conn closed
+	Closech  chan struct{}       // closed when conn closed
 	isProxy  bool
 	// writeErrCh passes the request write error (usually nil)
 	// from the WriteLoop goroutine to the readLoop which passes
@@ -1222,7 +1222,7 @@ type PersistConn struct {
 
 	lk                   sync.Mutex // guards following fields
 	numExpectedResponses int
-	closed               error // set non-nil when conn is closed, before closech is closed
+	closed               error // set non-nil when conn is closed, before Closech is closed
 	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
 	canceled             bool  // whether this conn was broken due a CancelRequest
 	reused               bool  // whether conn has had successful request/response and is being reused.
@@ -1410,7 +1410,7 @@ func (pc *PersistConn) ReadLoop() {
 		case <-rc.req.Cancel:
 			alive = false
 			pc.t.CancelRequest(rc.req)
-		case <-pc.closech:
+		case <-pc.Closech:
 			alive = false
 		}
 
@@ -1483,7 +1483,7 @@ func (pc *PersistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
 			return ok
 		case <-timer.C:
 			return true
-		case <-pc.closech:
+		case <-pc.Closech:
 			return false
 		}
 	}
@@ -1971,7 +1971,7 @@ func (pc *PersistConn) WriteLoop() {
 			}
 			pc.writeErrCh <- err // to the body reader, which might recycle us
 			wr.ch <- err         // to the roundTrip function
-		case <-pc.closech:
+		case <-pc.Closech:
 			return
 		}
 	}
@@ -2166,7 +2166,7 @@ WaitResponse:
 				defer timer.Stop() // prevent leaks
 				respHeaderTimer = timer.C
 			}
-		case <-pc.closech:
+		case <-pc.Closech:
 			var err error
 			if pc.IsCanceled() {
 				err = errRequestCanceled
@@ -2217,7 +2217,7 @@ func (pc *PersistConn) markReused() {
 }
 
 // close closes the underlying TCP connection and closes
-// the pc.closech channel.
+// the pc.Closech channel.
 //
 // The provided err is only for testing and debugging; in normal
 // circumstances it should never be seen by users.
@@ -2244,7 +2244,7 @@ func (pc *PersistConn) closeLocked(err error) {
 			// alternate protocol's RoundTripper.
 		} else {
 			pc.conn.Close()
-			close(pc.closech)
+			close(pc.Closech)
 		}
 	}
 	pc.MutateHeaderFunc = nil
