@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,135 @@ import (
 	"sync"
 	"time"
 )
+
+type BadStringError struct {
+	what string
+	str  string
+}
+
+func ValidMethod(method string) bool {
+	/*
+	     Method         = "OPTIONS"                ; Section 9.2
+	                    | "GET"                    ; Section 9.3
+	                    | "HEAD"                   ; Section 9.4
+	                    | "POST"                   ; Section 9.5
+	                    | "PUT"                    ; Section 9.6
+	                    | "DELETE"                 ; Section 9.7
+	                    | "TRACE"                  ; Section 9.8
+	                    | "CONNECT"                ; Section 9.9
+	                    | extension-method
+	   extension-method = token
+	     token          = 1*<any CHAR except CTLs or separators>
+	*/
+	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+}
+
+var ErrMissingHost = errors.New("http: Request.Write on Request with no Host or URL set")
+
+// See 2 (end of page 4) http://www.ietf.org/rfc/rfc2617.txt
+// "To receive authorization, the client sends the userid and password,
+// separated by a single colon (":") character, within a base64
+// encoded string in the credentials."
+// It is not meant to be urlencoded.
+func BasicAuth(username, password string) string {
+	auth := username + ":" + password
+	return base64.StdEncoding.EncodeToString([]byte(auth))
+}
+
+// Given a string of the form "host", "host:port", or "[ipv6::address]:port",
+// return true if the string includes a port.
+func HasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastIndex(s, "]") }
+
+// This file deals with lexical matters of HTTP
+
+var isTokenTable = [127]bool{
+	'!':  true,
+	'#':  true,
+	'$':  true,
+	'%':  true,
+	'&':  true,
+	'\'': true,
+	'*':  true,
+	'+':  true,
+	'-':  true,
+	'.':  true,
+	'0':  true,
+	'1':  true,
+	'2':  true,
+	'3':  true,
+	'4':  true,
+	'5':  true,
+	'6':  true,
+	'7':  true,
+	'8':  true,
+	'9':  true,
+	'A':  true,
+	'B':  true,
+	'C':  true,
+	'D':  true,
+	'E':  true,
+	'F':  true,
+	'G':  true,
+	'H':  true,
+	'I':  true,
+	'J':  true,
+	'K':  true,
+	'L':  true,
+	'M':  true,
+	'N':  true,
+	'O':  true,
+	'P':  true,
+	'Q':  true,
+	'R':  true,
+	'S':  true,
+	'T':  true,
+	'U':  true,
+	'W':  true,
+	'V':  true,
+	'X':  true,
+	'Y':  true,
+	'Z':  true,
+	'^':  true,
+	'_':  true,
+	'`':  true,
+	'a':  true,
+	'b':  true,
+	'c':  true,
+	'd':  true,
+	'e':  true,
+	'f':  true,
+	'g':  true,
+	'h':  true,
+	'i':  true,
+	'j':  true,
+	'k':  true,
+	'l':  true,
+	'm':  true,
+	'n':  true,
+	'o':  true,
+	'p':  true,
+	'q':  true,
+	'r':  true,
+	's':  true,
+	't':  true,
+	'u':  true,
+	'v':  true,
+	'w':  true,
+	'x':  true,
+	'y':  true,
+	'z':  true,
+	'|':  true,
+	'~':  true,
+}
+
+func IsToken(r rune) bool {
+	i := int(r)
+	return i < len(isTokenTable) && isTokenTable[i]
+}
+
+func IsNotToken(r rune) bool {
+	return !IsToken(r)
+}
 
 // DefaultTransport is the default implementation of Transport and is
 // used by DefaultClient. It establishes network connections as needed
@@ -288,9 +418,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if s := req.URL.Scheme; s != "http" && s != "https" {
 		req.Body.Close()
-		return nil, &badStringError{"unsupported protocol scheme", s}
+		return nil, &BadStringError{"unsupported protocol scheme", s}
 	}
-	if req.Method != "" && !validMethod(req.Method) {
+	if req.Method != "" && !ValidMethod(req.Method) {
 		return nil, fmt.Errorf("net/http: invalid method %q", req.Method)
 	}
 	if req.URL.Host == "" {
@@ -348,7 +478,7 @@ func checkTransportResend(err error, req *http.Request, pconn *persistConn) erro
 		return err
 	}
 	err = brhErr.error // unwrap the custom error in case we return it
-	if err != errMissingHost && pconn.isReused() && req.isReplayable() {
+	if err != ErrMissingHost && pconn.isReused() && req.isReplayable() {
 		// If we try to reuse a connection that the server is in the process of
 		// closing, we may end up successfully writing out our request (or a
 		// portion of our request) only to find a connection error when we try to
@@ -496,7 +626,7 @@ func (cm *connectMethod) proxyAuth() string {
 	if u := cm.proxyURL.User; u != nil {
 		username := u.Username()
 		password, _ := u.Password()
-		return "Basic " + basicAuth(username, password)
+		return "Basic " + BasicAuth(username, password)
 	}
 	return ""
 }
@@ -888,7 +1018,7 @@ func useProxy(addr string) bool {
 	}
 
 	addr = strings.ToLower(strings.TrimSpace(addr))
-	if hasPort(addr) {
+	if HasPort(addr) {
 		addr = addr[:strings.LastIndex(addr, ":")]
 	}
 
@@ -897,7 +1027,7 @@ func useProxy(addr string) bool {
 		if len(p) == 0 {
 			continue
 		}
-		if hasPort(p) {
+		if HasPort(p) {
 			p = p[:strings.LastIndex(p, ":")]
 		}
 		if addr == p {
@@ -963,7 +1093,7 @@ func (cm *connectMethod) addr() string {
 // TLS certificate.
 func (cm *connectMethod) tlsHost() string {
 	h := cm.targetAddr
-	if hasPort(h) {
+	if HasPort(h) {
 		h = h[:strings.LastIndex(h, ":")]
 	}
 	return h
@@ -1232,7 +1362,7 @@ func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
 // readResponse reads an HTTP response (or two, in the case of "Expect:
 // 100-continue") from the server. It returns the final non-100 one.
 func (pc *persistConn) readResponse(rc requestAndChan) (resp *http.Response, err error) {
-	resp, err = ReadResponse(pc.br, rc.req)
+	resp, err = http.ReadResponse(pc.br, rc.req)
 	if err != nil {
 		return
 	}
@@ -1244,7 +1374,7 @@ func (pc *persistConn) readResponse(rc requestAndChan) (resp *http.Response, err
 		}
 	}
 	if resp.StatusCode == 100 {
-		resp, err = ReadResponse(pc.br, rc.req)
+		resp, err = http.ReadResponse(pc.br, rc.req)
 		if err != nil {
 			return
 		}
@@ -1580,7 +1710,7 @@ var portMap = map[string]string{
 // canonicalAddr returns url.Host but always with a ":port" suffix
 func canonicalAddr(url *url.URL) string {
 	addr := url.Host
-	if !hasPort(addr) {
+	if !HasPort(addr) {
 		return addr + ":" + portMap[url.Scheme]
 	}
 	return addr
