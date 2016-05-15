@@ -1220,7 +1220,7 @@ type PersistConn struct {
 	// whether or not a connection can be reused. Issue 7569.
 	writeErrCh chan error
 
-	lk                   sync.Mutex // guards following fields
+	Lk                   sync.Mutex // guards following fields
 	numExpectedResponses int
 	closed               error // set non-nil when conn is closed, before Closech is closed
 	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
@@ -1234,30 +1234,30 @@ type PersistConn struct {
 
 // IsBroken reports whether this connection is in a known broken state.
 func (pc *PersistConn) IsBroken() bool {
-	pc.lk.Lock()
+	pc.Lk.Lock()
 	b := pc.broken
-	pc.lk.Unlock()
+	pc.Lk.Unlock()
 	return b
 }
 
 // IsCanceled reports whether this connection was closed due to CancelRequest.
 func (pc *PersistConn) IsCanceled() bool {
-	pc.lk.Lock()
-	defer pc.lk.Unlock()
+	pc.Lk.Lock()
+	defer pc.Lk.Unlock()
 	return pc.canceled
 }
 
 // IsReused reports whether this connection is in a known broken state.
 func (pc *PersistConn) IsReused() bool {
-	pc.lk.Lock()
+	pc.Lk.Lock()
 	r := pc.reused
-	pc.lk.Unlock()
+	pc.Lk.Unlock()
 	return r
 }
 
 func (pc *PersistConn) CancelRequest() {
-	pc.lk.Lock()
-	defer pc.lk.Unlock()
+	pc.Lk.Lock()
+	defer pc.Lk.Unlock()
 	pc.canceled = true
 	pc.closeLocked(errRequestCanceled)
 }
@@ -1292,13 +1292,13 @@ func (pc *PersistConn) ReadLoop() {
 			err = beforeRespHeaderError{err}
 		}
 
-		pc.lk.Lock()
+		pc.Lk.Lock()
 		if pc.numExpectedResponses == 0 {
 			pc.readLoopPeekFailLocked(err)
-			pc.lk.Unlock()
+			pc.Lk.Unlock()
 			return
 		}
-		pc.lk.Unlock()
+		pc.Lk.Unlock()
 
 		rc := <-pc.reqch
 
@@ -1326,9 +1326,9 @@ func (pc *PersistConn) ReadLoop() {
 			return
 		}
 
-		pc.lk.Lock()
+		pc.Lk.Lock()
 		pc.numExpectedResponses--
-		pc.lk.Unlock()
+		pc.Lk.Unlock()
 
 		hasBody := rc.req.Method != "HEAD" && resp.ContentLength != 0
 
@@ -2084,10 +2084,10 @@ func (pc *PersistConn) RoundTrip(req *TransportRequest) (resp *http.Response, er
 		pc.t.putOrCloseIdleConn(pc)
 		return nil, errRequestCanceled
 	}
-	pc.lk.Lock()
+	pc.Lk.Lock()
 	pc.numExpectedResponses++
 	headerFn := pc.MutateHeaderFunc
-	pc.lk.Unlock()
+	pc.Lk.Unlock()
 
 	if headerFn != nil {
 		headerFn(req.extraHeaders())
@@ -2203,17 +2203,17 @@ WaitResponse:
 // It differs from close in that it doesn't close the underlying
 // connection for use when it's still being read.
 func (pc *PersistConn) markBroken() {
-	pc.lk.Lock()
-	defer pc.lk.Unlock()
+	pc.Lk.Lock()
+	defer pc.Lk.Unlock()
 	pc.broken = true
 }
 
 // markReused marks this connection as having been successfully used for a
 // request and response.
 func (pc *PersistConn) markReused() {
-	pc.lk.Lock()
+	pc.Lk.Lock()
 	pc.reused = true
-	pc.lk.Unlock()
+	pc.Lk.Unlock()
 }
 
 // close closes the underlying TCP connection and closes
@@ -2222,8 +2222,8 @@ func (pc *PersistConn) markReused() {
 // The provided err is only for testing and debugging; in normal
 // circumstances it should never be seen by users.
 func (pc *PersistConn) close(err error) {
-	pc.lk.Lock()
-	defer pc.lk.Unlock()
+	pc.Lk.Lock()
+	defer pc.Lk.Unlock()
 	pc.closeLocked(err)
 }
 
