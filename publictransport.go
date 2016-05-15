@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -30,7 +31,7 @@ import (
 // and caches them for reuse by subsequent calls. It uses HTTP proxies
 // as directed by the $HTTP_PROXY and $NO_PROXY (or $http_proxy and
 // $no_proxy) environment variables.
-var DefaultTransport RoundTripper = &Transport{
+var DefaultTransport http.RoundTripper = &Transport{
 	Proxy: ProxyFromEnvironment,
 	Dial: (&net.Dialer{
 		Timeout:   30 * time.Second,
@@ -62,22 +63,24 @@ const DefaultMaxIdleConnsPerHost = 2
 // for HTTPS URLs, depending on whether the server supports HTTP/2.
 // See the package docs for more about HTTP/2.
 type Transport struct {
+	http.Transport
+
 	idleMu     sync.Mutex
 	wantIdle   bool // user has requested to close all idle conns
 	idleConn   map[connectMethodKey][]*persistConn
 	idleConnCh map[connectMethodKey]chan *persistConn
 
 	reqMu       sync.Mutex
-	reqCanceler map[*Request]func()
+	reqCanceler map[*http.Request]func()
 
 	altMu    sync.RWMutex
-	altProto map[string]RoundTripper // nil or map of URI scheme => RoundTripper
+	altProto map[string]http.RoundTripper // nil or map of URI scheme => RoundTripper
 
 	// Proxy specifies a function to return a proxy for a given
 	// Request. If the function returns a non-nil error, the
 	// request is aborted with the provided error.
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
-	Proxy func(*Request) (*url.URL, error)
+	Proxy func(*http.Request) (*url.URL, error)
 
 	// Dial specifies the dial function for creating unencrypted
 	// TCP connections.
@@ -144,7 +147,7 @@ type Transport struct {
 	// or "example.com:1234") and the TLS connection. The function
 	// must return a RoundTripper that then handles the request.
 	// If TLSNextProto is nil, HTTP/2 support is enabled automatically.
-	TLSNextProto map[string]func(authority string, c *tls.Conn) RoundTripper
+	TLSNextProto map[string]func(authority string, c *tls.Conn) http.RoundTripper
 
 	// nextProtoOnce guards initialization of TLSNextProto and
 	// h2transport (via onceSetNextProtoDefaults)
@@ -209,7 +212,7 @@ func (t *Transport) onceSetNextProtoDefaults() {
 //
 // As a special case, if req.URL.Host is "localhost" (with or without
 // a port number), then a nil URL and nil error will be returned.
-func ProxyFromEnvironment(req *Request) (*url.URL, error) {
+func ProxyFromEnvironment(req *http.Request) (*url.URL, error) {
 	var proxy string
 	if req.URL.Scheme == "https" {
 		proxy = httpsProxyEnv.Get()
@@ -240,22 +243,22 @@ func ProxyFromEnvironment(req *Request) (*url.URL, error) {
 
 // ProxyURL returns a proxy function (for use in a Transport)
 // that always returns the same URL.
-func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
-	return func(*Request) (*url.URL, error) {
+func ProxyURL(fixedURL *url.URL) func(*http.Request) (*url.URL, error) {
+	return func(*http.Request) (*url.URL, error) {
 		return fixedURL, nil
 	}
 }
 
-// transportRequest is a wrapper around a *Request that adds
+// transportRequest is a wrapper around a *http.Request that adds
 // optional extra headers to write.
 type transportRequest struct {
-	*Request        // original request, not to be mutated
-	extra    Header // extra headers to write, or nil
+	*http.Request        // original request, not to be mutated
+	extra    http.Header // extra headers to write, or nil
 }
 
-func (tr *transportRequest) extraHeaders() Header {
+func (tr *transportRequest) extraHeaders() http.Header {
 	if tr.extra == nil {
-		tr.extra = make(Header)
+		tr.extra = make(http.Header)
 	}
 	return tr.extra
 }
@@ -264,7 +267,7 @@ func (tr *transportRequest) extraHeaders() Header {
 //
 // For higher-level HTTP client support (such as handling of cookies
 // and redirects), see Get, Post, and the Client type.
-func (t *Transport) RoundTrip(req *Request) (*Response, error) {
+func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	if req.URL == nil {
 		req.closeBody()
@@ -315,7 +318,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 			return nil, err
 		}
 
-		var resp *Response
+		var resp *http.Response
 		if pconn.alt != nil {
 			// HTTP/2 path.
 			t.setReqCanceler(req, nil) // not cancelable with CancelRequest
@@ -339,7 +342,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 //
 // The return value is err or the unwrapped error inside a
 // beforeRespHeaderError.
-func checkTransportResend(err error, req *Request, pconn *persistConn) error {
+func checkTransportResend(err error, req *http.Request, pconn *persistConn) error {
 	brhErr, ok := err.(beforeRespHeaderError)
 	if !ok {
 		return err
@@ -381,11 +384,11 @@ var ErrSkipAltProtocol = errors.New("net/http: skip alternate protocol")
 // If rt.RoundTrip returns ErrSkipAltProtocol, the Transport will
 // handle the RoundTrip itself for that one request, as if the
 // protocol were not registered.
-func (t *Transport) RegisterProtocol(scheme string, rt RoundTripper) {
+func (t *Transport) RegisterProtocol(scheme string, rt http.RoundTripper) {
 	t.altMu.Lock()
 	defer t.altMu.Unlock()
 	if t.altProto == nil {
-		t.altProto = make(map[string]RoundTripper)
+		t.altProto = make(map[string]http.RoundTripper)
 	}
 	if _, exists := t.altProto[scheme]; exists {
 		panic("protocol " + scheme + " already registered")
@@ -420,7 +423,7 @@ func (t *Transport) CloseIdleConnections() {
 //
 // Deprecated: Use Request.Cancel instead. CancelRequest can not cancel
 // HTTP/2 requests.
-func (t *Transport) CancelRequest(req *Request) {
+func (t *Transport) CancelRequest(req *http.Request) {
 	t.reqMu.Lock()
 	cancel := t.reqCanceler[req]
 	delete(t.reqCanceler, req)
@@ -622,11 +625,11 @@ func (t *Transport) getIdleConn(cm connectMethod) (pconn *persistConn) {
 	}
 }
 
-func (t *Transport) setReqCanceler(r *Request, fn func()) {
+func (t *Transport) setReqCanceler(r *http.Request, fn func()) {
 	t.reqMu.Lock()
 	defer t.reqMu.Unlock()
 	if t.reqCanceler == nil {
-		t.reqCanceler = make(map[*Request]func())
+		t.reqCanceler = make(map[*http.Request]func())
 	}
 	if fn != nil {
 		t.reqCanceler[r] = fn
@@ -639,7 +642,7 @@ func (t *Transport) setReqCanceler(r *Request, fn func()) {
 // for the request, we don't set the function and return false.
 // Since CancelRequest will clear the canceler, we can use the return value to detect if
 // the request was canceled since the last setReqCancel call.
-func (t *Transport) replaceReqCanceler(r *Request, fn func()) bool {
+func (t *Transport) replaceReqCanceler(r *http.Request, fn func()) bool {
 	t.reqMu.Lock()
 	defer t.reqMu.Unlock()
 	_, ok := t.reqCanceler[r]
@@ -669,7 +672,7 @@ func (t *Transport) dial(network, addr string) (net.Conn, error) {
 // specified in the connectMethod.  This includes doing a proxy CONNECT
 // and/or setting up TLS.  If this doesn't return an error, the persistConn
 // is ready to write requests to.
-func (t *Transport) getConn(req *Request, cm connectMethod) (*persistConn, error) {
+func (t *Transport) getConn(req *http.Request, cm connectMethod) (*persistConn, error) {
 	if pc := t.getIdleConn(cm); pc != nil {
 		// set request canceler to some non-nil function so we
 		// can detect whether it was cleared between now and when
@@ -776,17 +779,17 @@ func (t *Transport) dialConn(cm connectMethod) (*persistConn, error) {
 	case cm.targetScheme == "http":
 		pconn.isProxy = true
 		if pa := cm.proxyAuth(); pa != "" {
-			pconn.mutateHeaderFunc = func(h Header) {
+			pconn.mutateHeaderFunc = func(h http.Header) {
 				h.Set("Proxy-Authorization", pa)
 			}
 		}
 	case cm.targetScheme == "https":
 		conn := pconn.conn
-		connectReq := &Request{
+		connectReq := &http.Request{
 			Method: "CONNECT",
 			URL:    &url.URL{Opaque: cm.targetAddr},
 			Host:   cm.targetAddr,
-			Header: make(Header),
+			Header: make(http.Header),
 		}
 		if pa := cm.proxyAuth(); pa != "" {
 			connectReq.Header.Set("Proxy-Authorization", pa)
@@ -797,7 +800,7 @@ func (t *Transport) dialConn(cm connectMethod) (*persistConn, error) {
 		// Okay to use and discard buffered reader here, because
 		// TLS server will not speak until spoken to.
 		br := bufio.NewReader(conn)
-		resp, err := ReadResponse(br, connectReq)
+		resp, err := http.ReadResponse(br, connectReq)
 		if err != nil {
 			conn.Close()
 			return nil, err
@@ -984,7 +987,7 @@ type persistConn struct {
 	// alt optionally specifies the TLS NextProto RoundTripper.
 	// This is used for HTTP/2 today and future protocol laters.
 	// If it's non-nil, the rest of the fields are unused.
-	alt RoundTripper
+	alt http.RoundTripper
 
 	t        *Transport
 	cacheKey connectMethodKey
@@ -1012,7 +1015,7 @@ type persistConn struct {
 	// mutateHeaderFunc is an optional func to modify extra
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
-	mutateHeaderFunc func(Header)
+	mutateHeaderFunc func(http.Header)
 }
 
 // isBroken reports whether this connection is in a known broken state.
@@ -1085,7 +1088,7 @@ func (pc *persistConn) readLoop() {
 
 		rc := <-pc.reqch
 
-		var resp *Response
+		var resp *http.Response
 		if err == nil {
 			resp, err = pc.readResponse(rc)
 		}
@@ -1094,7 +1097,7 @@ func (pc *persistConn) readLoop() {
 			// If we won't be able to retry this request later (from the
 			// roundTrip goroutine), mark it as done now.
 			// BEFORE the send on rc.ch, as the client might re-use the
-			// same *Request pointer, and we don't want to set call
+			// same *http.Request pointer, and we don't want to set call
 			// t.setReqCanceler from this persistConn while the Transport
 			// potentially spins up a different persistConn for the
 			// caller's subsequent request.
@@ -1201,7 +1204,7 @@ func (pc *persistConn) readLoop() {
 	}
 }
 
-func maybeUngzipResponse(resp *Response) {
+func maybeUngzipResponse(resp *http.Response) {
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")
@@ -1228,7 +1231,7 @@ func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
 
 // readResponse reads an HTTP response (or two, in the case of "Expect:
 // 100-continue") from the server. It returns the final non-100 one.
-func (pc *persistConn) readResponse(rc requestAndChan) (resp *Response, err error) {
+func (pc *persistConn) readResponse(rc requestAndChan) (resp *http.Response, err error) {
 	resp, err = ReadResponse(pc.br, rc.req)
 	if err != nil {
 		return
@@ -1327,12 +1330,12 @@ func (pc *persistConn) wroteRequest() bool {
 // responseAndError is how the goroutine reading from an HTTP/1 server
 // communicates with the goroutine doing the RoundTrip.
 type responseAndError struct {
-	res *Response // else use this response (see res method)
+	res *http.Response // else use this response (see res method)
 	err error
 }
 
 type requestAndChan struct {
-	req *Request
+	req *http.Request
 	ch  chan responseAndError // unbuffered; always send in select on callerGone
 
 	// did the Transport (as opposed to the client code) add an
@@ -1397,7 +1400,7 @@ type beforeRespHeaderError struct {
 	error
 }
 
-func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *http.Response, err error) {
 	testHookEnterRoundTrip()
 	if !pc.t.replaceReqCanceler(req.Request, pc.cancelRequest) {
 		pc.t.putOrCloseIdleConn(pc)
