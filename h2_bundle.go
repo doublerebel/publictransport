@@ -24,11 +24,12 @@ import (
   "encoding/binary"
   "errors"
   "fmt"
-  "internal/golang.org/x/net/http2/hpack"
+  "golang.org/x/net/http2/hpack"
   "io"
   "io/ioutil"
   "log"
   "net"
+  "net/http"
   "net/textproto"
   "net/url"
   "os"
@@ -43,7 +44,7 @@ import (
 
 // ClientConnPool manages a pool of HTTP/2 client connections.
 type http2ClientConnPool interface {
-  GetClientConn(req *Request, addr string) (*http2ClientConn, error)
+  GetClientConn(req *http.Request, addr string) (*http2ClientConn, error)
   MarkDead(*http2ClientConn)
 }
 
@@ -60,7 +61,7 @@ type http2clientConnPool struct {
   addConnCalls map[string]*http2addConnCall // in-flight addConnIfNeede calls
 }
 
-func (p *http2clientConnPool) GetClientConn(req *Request, addr string) (*http2ClientConn, error) {
+func (p *http2clientConnPool) GetClientConn(req *http.Request, addr string) (*http2ClientConn, error) {
   return p.getClientConn(req, addr, http2dialOnMiss)
 }
 
@@ -69,7 +70,7 @@ const (
   http2noDialOnMiss = false
 )
 
-func (p *http2clientConnPool) getClientConn(_ *Request, addr string, dialOnMiss bool) (*http2ClientConn, error) {
+func (p *http2clientConnPool) getClientConn(_ *http.Request, addr string, dialOnMiss bool) (*http2ClientConn, error) {
   p.mu.Lock()
   for _, cc := range p.conns[addr] {
     if cc.CanTakeNewRequest() {
@@ -266,7 +267,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
   if !http2strSliceContains(t1.TLSClientConfig.NextProtos, "http/1.1") {
     t1.TLSClientConfig.NextProtos = append(t1.TLSClientConfig.NextProtos, "http/1.1")
   }
-  upgradeFn := func(authority string, c *tls.Conn) RoundTripper {
+  upgradeFn := func(authority string, c *tls.Conn) http.RoundTripper {
     addr := http2authorityAddr(authority)
     if used, err := connPool.addConnIfNeeded(addr, t2, c); err != nil {
       go c.Close()
@@ -278,7 +279,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
     return t2
   }
   if m := t1.TLSNextProto; len(m) == 0 {
-    t1.TLSNextProto = map[string]func(string, *tls.Conn) RoundTripper{
+    t1.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{
       "h2": upgradeFn,
     }
   } else {
@@ -289,7 +290,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 
 // registerHTTPSProtocol calls Transport.RegisterProtocol but
 // convering panics into errors.
-func http2registerHTTPSProtocol(t *Transport, rt RoundTripper) (err error) {
+func http2registerHTTPSProtocol(t *Transport, rt http.RoundTripper) (err error) {
   defer func() {
     if e := recover(); e != nil {
       err = fmt.Errorf("%v", e)
@@ -304,7 +305,7 @@ func http2registerHTTPSProtocol(t *Transport, rt RoundTripper) (err error) {
 // connection instead.
 type http2noDialClientConnPool struct{ *http2clientConnPool }
 
-func (p http2noDialClientConnPool) GetClientConn(req *Request, addr string) (*http2ClientConn, error) {
+func (p http2noDialClientConnPool) GetClientConn(req *http.Request, addr string) (*http2ClientConn, error) {
   return p.getClientConn(req, addr, http2noDialOnMiss)
 }
 
@@ -312,7 +313,7 @@ func (p http2noDialClientConnPool) GetClientConn(req *Request, addr string) (*ht
 // if there's already has a cached connection to the host.
 type http2noDialH2RoundTripper struct{ t *http2Transport }
 
-func (rt http2noDialH2RoundTripper) RoundTrip(req *Request) (*Response, error) {
+func (rt http2noDialH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
   res, err := rt.t.RoundTrip(req)
   if err == http2ErrNoCachedConn {
     return nil, ErrSkipAltProtocol
@@ -1712,7 +1713,7 @@ func http2summarizeFrame(f http2Frame) string {
   return buf.String()
 }
 
-func http2requestCancel(req *Request) <-chan struct{} { return req.Cancel }
+func http2requestCancel(req *http.Request) <-chan struct{} { return req.Cancel }
 
 var http2DebugGoroutines = os.Getenv("DEBUG_HTTP2_GOROUTINES") == "1"
 
@@ -1920,7 +1921,7 @@ func init() {
     "via",
     "www-authenticate",
   } {
-    chk := CanonicalHeaderKey(v)
+    chk := http.CanonicalHeaderKey(v)
     http2commonLowerHeader[chk] = v
     http2commonCanonHeader[v] = chk
   }
@@ -2131,7 +2132,7 @@ var http2httpCodeStringCommon = map[int]string{} // n -> strconv.Itoa(n)
 
 func init() {
   for i := 100; i <= 999; i++ {
-    if v := StatusText(i); v != "" {
+    if v := http.StatusText(i); v != "" {
       http2httpCodeStringCommon[i] = strconv.Itoa(i)
     }
   }
@@ -2546,7 +2547,7 @@ func (s *http2Server) maxConcurrentStreams() uint32 {
 // The configuration conf may be nil.
 //
 // ConfigureServer must be called before s begins serving.
-func http2ConfigureServer(s *Server, conf *http2Server) error {
+func http2ConfigureServer(s *http.Server, conf *http2Server) error {
   if conf == nil {
     conf = new(http2Server)
   }
@@ -2591,9 +2592,9 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
   s.TLSConfig.NextProtos = append(s.TLSConfig.NextProtos, "h2-14")
 
   if s.TLSNextProto == nil {
-    s.TLSNextProto = map[string]func(*Server, *tls.Conn, Handler){}
+    s.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
   }
-  protoHandler := func(hs *Server, c *tls.Conn, h Handler) {
+  protoHandler := func(hs *http.Server, c *tls.Conn, h http.Handler) {
     if http2testHookOnConn != nil {
       http2testHookOnConn()
     }
@@ -2611,22 +2612,22 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 type http2ServeConnOpts struct {
   // BaseConfig optionally sets the base configuration
   // for values. If nil, defaults are used.
-  BaseConfig *Server
+  BaseConfig *http.Server
 
   // Handler specifies which handler to use for processing
   // requests. If nil, BaseConfig.Handler is used. If BaseConfig
   // or BaseConfig.Handler is nil, http.DefaultServeMux is used.
-  Handler Handler
+  Handler http.Handler
 }
 
-func (o *http2ServeConnOpts) baseConfig() *Server {
+func (o *http2ServeConnOpts) baseConfig() *http.Server {
   if o != nil && o.BaseConfig != nil {
     return o.BaseConfig
   }
-  return new(Server)
+  return new(http.Server)
 }
 
-func (o *http2ServeConnOpts) handler() Handler {
+func (o *http2ServeConnOpts) handler() http.Handler {
   if o != nil {
     if o.Handler != nil {
       return o.Handler
@@ -2635,7 +2636,7 @@ func (o *http2ServeConnOpts) handler() Handler {
       return o.BaseConfig.Handler
     }
   }
-  return DefaultServeMux
+  return http.DefaultServeMux
 }
 
 // ServeConn serves HTTP/2 requests on the provided connection and
@@ -2743,10 +2744,10 @@ func (sc *http2serverConn) rejectConn(err http2ErrCode, debug string) {
 type http2serverConn struct {
   // Immutable:
   srv              *http2Server
-  hs               *Server
+  hs               *http.Server
   conn             net.Conn
   bw               *http2bufferedWriter // writing to conn
-  handler          Handler
+  handler          http.Handler
   framer           *http2Framer
   hpackDecoder     *hpack.Decoder
   doneServing      chan struct{}              // closed when serverConn.serve ends
@@ -2802,7 +2803,7 @@ func (sc *http2serverConn) maxHeaderStringLen() int {
 func (sc *http2serverConn) maxHeaderListSize() uint32 {
   n := sc.hs.MaxHeaderBytes
   if n <= 0 {
-    n = DefaultMaxHeaderBytes
+    n = http.DefaultMaxHeaderBytes
   }
   // http2's count is in a slightly different unit and includes 32 bytes per pair.
   // So, take the net/http.Server value and pad it up a bit, assuming 10 headers.
@@ -2818,7 +2819,7 @@ type http2requestParam struct {
   // stream is non-nil if we're reading (HEADER or CONTINUATION)
   // frames for a request (but not DATA).
   stream            *http2stream
-  header            Header
+  header            http.Header
   method, path      string
   scheme, authority string
   sawRegularHeader  bool  // saw a non-pseudo header already
@@ -2853,8 +2854,8 @@ type http2stream struct {
   gotReset         bool // only true once detacted from streams map
   gotTrailerHeader bool // HEADER frame for trailers was seen
 
-  trailer    Header // accumulated trailers
-  reqTrailer Header // handler's Request.Trailer
+  trailer    http.Header // accumulated trailers
+  reqTrailer http.Header // handler's Request.Trailer
 }
 
 func (sc *http2serverConn) Framer() *http2Framer { return sc.framer }
@@ -2883,7 +2884,7 @@ func (sc *http2serverConn) state(streamID uint32) (http2streamState, *http2strea
 // setConnState calls the net/http ConnState hook for this connection, if configured.
 // Note that the net/http package does StateNew and StateClosed for us.
 // There is currently no plan for StateHijacked or hijacking HTTP/2 connections.
-func (sc *http2serverConn) setConnState(state ConnState) {
+func (sc *http2serverConn) setConnState(state http.ConnState) {
   if sc.hs.ConnState != nil {
     sc.hs.ConnState(sc.conn, state)
   }
@@ -3042,7 +3043,7 @@ func (sc *http2serverConn) canonicalHeader(v string) string {
   if sc.canonHeader == nil {
     sc.canonHeader = make(map[string]string)
   }
-  cv = CanonicalHeaderKey(v)
+  cv = http.CanonicalHeaderKey(v)
   sc.canonHeader[v] = cv
   return cv
 }
@@ -3151,8 +3152,8 @@ func (sc *http2serverConn) serve() {
     return
   }
 
-  sc.setConnState(StateActive)
-  sc.setConnState(StateIdle)
+  sc.setConnState(http.StateActive)
+  sc.setConnState(http.StateIdle)
 
   go sc.readFrames()
 
@@ -3592,7 +3593,7 @@ func (sc *http2serverConn) closeStream(st *http2stream, err error) {
   st.state = http2stateClosed
   sc.curOpenStreams--
   if sc.curOpenStreams == 0 {
-    sc.setConnState(StateIdle)
+    sc.setConnState(http.StateIdle)
   }
   delete(sc.streams, st.id)
   if p := st.body; p != nil {
@@ -3777,11 +3778,11 @@ func (sc *http2serverConn) processHeaders(f *http2HeadersFrame) error {
   }
   sc.curOpenStreams++
   if sc.curOpenStreams == 1 {
-    sc.setConnState(StateActive)
+    sc.setConnState(http.StateActive)
   }
   sc.req = http2requestParam{
     stream: st,
-    header: make(Header),
+    header: make(http.Header),
   }
   sc.hpackDecoder.SetEmitFunc(sc.onNewHeaderField)
   sc.hpackDecoder.SetEmitEnabled(true)
@@ -3839,7 +3840,7 @@ func (sc *http2serverConn) processHeaderBlockFragment(st *http2stream, frag []by
   }
   st.reqTrailer = req.Trailer
   if st.reqTrailer != nil {
-    st.trailer = make(Header)
+    st.trailer = make(http.Header)
   }
   st.body = req.Body.(*http2requestBody).pipe
   st.declBodyBytes = req.ContentLength
@@ -3920,7 +3921,7 @@ func (sc *http2serverConn) resetPendingRequest() {
   sc.req = http2requestParam{}
 }
 
-func (sc *http2serverConn) newWriterAndRequest() (*http2responseWriter, *Request, error) {
+func (sc *http2serverConn) newWriterAndRequest() (*http2responseWriter, *http.Request, error) {
   sc.serveG.check()
   rp := &sc.req
 
@@ -3963,16 +3964,16 @@ func (sc *http2serverConn) newWriterAndRequest() (*http2responseWriter, *Request
   }
 
   // Setup Trailers
-  var trailer Header
+  var trailer http.Header
   for _, v := range rp.header["Trailer"] {
     for _, key := range strings.Split(v, ",") {
-      key = CanonicalHeaderKey(strings.TrimSpace(key))
+      key = http.CanonicalHeaderKey(strings.TrimSpace(key))
       switch key {
       case "Transfer-Encoding", "Trailer", "Content-Length":
 
       default:
         if trailer == nil {
-          trailer = make(Header)
+          trailer = make(http.Header)
         }
         trailer[key] = nil
       }
@@ -3998,7 +3999,7 @@ func (sc *http2serverConn) newWriterAndRequest() (*http2responseWriter, *Request
     }
     requestURI = rp.path
   }
-  req := &Request{
+  req := &http.Request{
     Method:     rp.method,
     URL:        url_,
     RemoteAddr: sc.remoteAddrStr,
@@ -4039,7 +4040,7 @@ func (sc *http2serverConn) newWriterAndRequest() (*http2responseWriter, *Request
 }
 
 // Run on its own goroutine.
-func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
+func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) {
   didPanic := true
   defer func() {
     if didPanic {
@@ -4061,7 +4062,7 @@ func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, han
   didPanic = false
 }
 
-func http2handleHeaderListTooLong(w ResponseWriter, r *Request) {
+func http2handleHeaderListTooLong(w http.ResponseWriter, r *http.Request) {
   // 10.5.1 Limits on Header Block Size:
   // .. "A server that receives a larger header block than it is
   // willing to handle can send an HTTP 431 (Request Header Fields Too
@@ -4223,15 +4224,15 @@ type http2responseWriter struct {
 
 // Optional http.ResponseWriter interfaces implemented.
 var (
-  _ CloseNotifier     = (*http2responseWriter)(nil)
-  _ Flusher           = (*http2responseWriter)(nil)
+  _ http.CloseNotifier     = (*http2responseWriter)(nil)
+  _ http.Flusher           = (*http2responseWriter)(nil)
   _ http2stringWriter = (*http2responseWriter)(nil)
 )
 
 type http2responseWriterState struct {
   // immutable within a request:
   stream *http2stream
-  req    *Request
+  req    *http.Request
   body   *http2requestBody // to close at end of request, if DATA frames didn't
   conn   *http2serverConn
 
@@ -4239,8 +4240,8 @@ type http2responseWriterState struct {
   bw *bufio.Writer // writing to a chunkWriter{this *responseWriterState}
 
   // mutated by http.Handler goroutine:
-  handlerHeader Header   // nil until called
-  snapHeader    Header   // snapshot of handlerHeader at WriteHeader time
+  handlerHeader http.Header   // nil until called
+  snapHeader    http.Header   // snapshot of handlerHeader at WriteHeader time
   trailers      []string // set in writeChunk
   status        int      // status code passed to WriteHeader
   wroteHeader   bool     // WriteHeader called (explicitly or implicitly). Not necessarily sent to user yet.
@@ -4264,7 +4265,7 @@ func (rws *http2responseWriterState) hasTrailers() bool { return len(rws.trailer
 // response header is written. It notes that a header will need to be
 // written in the trailers at the end of the response.
 func (rws *http2responseWriterState) declareTrailer(k string) {
-  k = CanonicalHeaderKey(k)
+  k = http.CanonicalHeaderKey(k)
   switch k {
   case "Transfer-Encoding", "Content-Length", "Trailer":
 
@@ -4304,12 +4305,12 @@ func (rws *http2responseWriterState) writeChunk(p []byte) (n int, err error) {
     }
     _, hasContentType := rws.snapHeader["Content-Type"]
     if !hasContentType && http2bodyAllowedForStatus(rws.status) {
-      ctype = DetectContentType(p)
+      ctype = http.DetectContentType(p)
     }
     var date string
     if _, ok := rws.snapHeader["Date"]; !ok {
 
-      date = time.Now().UTC().Format(TimeFormat)
+      date = time.Now().UTC().Format(http.TimeFormat)
     }
 
     for _, v := range rws.snapHeader["Trailer"] {
@@ -4406,7 +4407,7 @@ func (rws *http2responseWriterState) promoteUndeclaredTrailers() {
     }
     trailerKey := strings.TrimPrefix(k, http2TrailerPrefix)
     rws.declareTrailer(trailerKey)
-    rws.handlerHeader[CanonicalHeaderKey(trailerKey)] = vv
+    rws.handlerHeader[http.CanonicalHeaderKey(trailerKey)] = vv
   }
   sort.Strings(rws.trailers)
 }
@@ -4446,13 +4447,13 @@ func (w *http2responseWriter) CloseNotify() <-chan bool {
   return ch
 }
 
-func (w *http2responseWriter) Header() Header {
+func (w *http2responseWriter) Header() http.Header {
   rws := w.rws
   if rws == nil {
     panic("Header called after Handler finished")
   }
   if rws.handlerHeader == nil {
-    rws.handlerHeader = make(Header)
+    rws.handlerHeader = make(http.Header)
   }
   return rws.handlerHeader
 }
@@ -4475,8 +4476,8 @@ func (rws *http2responseWriterState) writeHeader(code int) {
   }
 }
 
-func http2cloneHeader(h Header) Header {
-  h2 := make(Header, len(h))
+func http2cloneHeader(h http.Header) http.Header {
+  h2 := make(http.Header, len(h))
   for k, vv := range h {
     vv2 := make([]string, len(vv))
     copy(vv2, vv)
@@ -4511,7 +4512,7 @@ func (w *http2responseWriter) write(lenData int, dataB []byte, dataS string) (n 
     w.WriteHeader(200)
   }
   if !http2bodyAllowedForStatus(rws.status) {
-    return 0, ErrBodyNotAllowed
+    return 0, http.ErrBodyNotAllowed
   }
   rws.wroteBytes += int64(len(dataB)) + int64(len(dataS))
   if rws.sentContentLen != 0 && rws.wroteBytes > rws.sentContentLen {
@@ -4694,7 +4695,7 @@ type http2ClientConn struct {
 // is created for each Transport.RoundTrip call.
 type http2clientStream struct {
   cc            *http2ClientConn
-  req           *Request
+  req           *http.Request
   ID            uint32
   resc          chan http2resAndError
   bufPipe       http2pipe // buffered pipe with the flow-controlled response payload
@@ -4715,8 +4716,8 @@ type http2clientStream struct {
   pastHeaders  bool // got HEADERS w/ END_HEADERS
   pastTrailers bool // got second HEADERS frame w/ END_HEADERS
 
-  trailer    Header  // accumulated trailers
-  resTrailer *Header // client's Response.Trailer
+  trailer    http.Header  // accumulated trailers
+  resTrailer *http.Header // client's Response.Trailer
 }
 
 // awaitRequestCancel runs in its own goroutine and waits for the user
@@ -4783,7 +4784,7 @@ type http2RoundTripOpt struct {
   OnlyCachedConn bool
 }
 
-func (t *http2Transport) RoundTrip(req *Request) (*Response, error) {
+func (t *http2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
   return t.RoundTripOpt(req, http2RoundTripOpt{})
 }
 
@@ -4797,7 +4798,7 @@ func http2authorityAddr(authority string) (addr string) {
 }
 
 // RoundTripOpt is like RoundTrip, but takes options.
-func (t *http2Transport) RoundTripOpt(req *Request, opt http2RoundTripOpt) (*Response, error) {
+func (t *http2Transport) RoundTripOpt(req *http.Request, opt http2RoundTripOpt) (*http.Response, error) {
   if req.URL.Scheme != "https" {
     return nil, errors.New("http2: unsupported scheme")
   }
@@ -4835,7 +4836,7 @@ var (
   http2errClientConnUnusable = errors.New("http2: client conn not usable")
 )
 
-func http2shouldRetryRequest(req *Request, err error) bool {
+func http2shouldRetryRequest(req *http.Request, err error) bool {
 
   return err == http2errClientConnUnusable
 }
@@ -5051,10 +5052,10 @@ func (cc *http2ClientConn) putFrameScratchBuffer(buf []byte) {
 // exported. At least they'll be DeepEqual for h1-vs-h2 comparisons tests.
 var http2errRequestCanceled = errors.New("net/http: request canceled")
 
-func http2commaSeparatedTrailers(req *Request) (string, error) {
+func http2commaSeparatedTrailers(req *http.Request) (string, error) {
   keys := make([]string, 0, len(req.Trailer))
   for k := range req.Trailer {
-    k = CanonicalHeaderKey(k)
+    k = http.CanonicalHeaderKey(k)
     switch k {
     case "Transfer-Encoding", "Trailer", "Content-Length":
       return "", &http2badStringError{"invalid Trailer key", k}
@@ -5080,7 +5081,7 @@ func (cc *http2ClientConn) responseHeaderTimeout() time.Duration {
 // checkConnHeaders checks whether req has any invalid connection-level headers.
 // per RFC 7540 section 8.1.2.2: Connection-Specific Header Fields.
 // Certain headers are special-cased as okay but not transmitted later.
-func http2checkConnHeaders(req *Request) error {
+func http2checkConnHeaders(req *http.Request) error {
   if v := req.Header.Get("Upgrade"); v != "" {
     return errors.New("http2: invalid Upgrade request header")
   }
@@ -5093,7 +5094,7 @@ func http2checkConnHeaders(req *Request) error {
   return nil
 }
 
-func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
+func (cc *http2ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
   if err := http2checkConnHeaders(req); err != nil {
     return nil, err
   }
@@ -5382,7 +5383,7 @@ type http2badStringError struct {
 func (e *http2badStringError) Error() string { return fmt.Sprintf("%s %q", e.what, e.str) }
 
 // requires cc.mu be held.
-func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trailers string, contentLength int64) []byte {
+func (cc *http2ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trailers string, contentLength int64) []byte {
   cc.hbuf.Reset()
 
   host := req.Host
@@ -5459,7 +5460,7 @@ func http2shouldSendReqContentLength(method string, contentLength int64) bool {
 }
 
 // requires cc.mu be held.
-func (cc *http2ClientConn) encodeTrailers(req *Request) []byte {
+func (cc *http2ClientConn) encodeTrailers(req *http.Request) []byte {
   cc.hbuf.Reset()
   for k, vv := range req.Trailer {
 
@@ -5479,7 +5480,7 @@ func (cc *http2ClientConn) writeHeader(name, value string) {
 }
 
 type http2resAndError struct {
-  res *Response
+  res *http.Response
   err error
 }
 
@@ -5525,7 +5526,7 @@ type http2clientConnReadLoop struct {
   hdec *hpack.Decoder
 
   // Fields reset on each HEADERS:
-  nextRes              *Response
+  nextRes              *http.Response
   sawRegHeader         bool  // saw non-pseudo header
   reqMalformed         error // non-nil once known to be malformed
   lastHeaderEndsStream bool
@@ -5637,10 +5638,10 @@ func (rl *http2clientConnReadLoop) processHeaders(f *http2HeadersFrame) error {
   rl.reqMalformed = nil
   rl.lastHeaderEndsStream = f.StreamEnded()
   rl.headerListSize = 0
-  rl.nextRes = &Response{
+  rl.nextRes = &http.Response{
     Proto:      "HTTP/2.0",
     ProtoMajor: 2,
-    Header:     make(Header),
+    Header:     make(http.Header),
   }
   rl.hdec.SetEmitEnabled(true)
   return rl.processHeaderBlockFragment(f.HeaderBlockFragment(), f.StreamID, f.HeadersEnded())
@@ -5886,7 +5887,7 @@ func (cs *http2clientStream) copyTrailers() {
   for k, vv := range cs.trailer {
     t := cs.resTrailer
     if *t == nil {
-      *t = make(Header)
+      *t = make(http.Header)
     }
     (*t)[k] = vv
   }
@@ -6053,7 +6054,7 @@ func (rl *http2clientConnReadLoop) onNewHeaderField(f hpack.HeaderField) {
         rl.reqMalformed = errors.New("http2: invalid :status")
         return
       }
-      rl.nextRes.Status = f.Value + " " + StatusText(code)
+      rl.nextRes.Status = f.Value + " " + http.StatusText(code)
       rl.nextRes.StatusCode = code
     default:
 
@@ -6062,15 +6063,15 @@ func (rl *http2clientConnReadLoop) onNewHeaderField(f hpack.HeaderField) {
     return
   }
 
-  key := CanonicalHeaderKey(f.Name)
+  key := http.CanonicalHeaderKey(f.Name)
   if key == "Trailer" {
     t := rl.nextRes.Trailer
     if t == nil {
-      t = make(Header)
+      t = make(http.Header)
       rl.nextRes.Trailer = t
     }
     http2foreachHeaderElement(f.Value, func(v string) {
-      t[CanonicalHeaderKey(v)] = nil
+      t[http.CanonicalHeaderKey(v)] = nil
     })
   } else {
     rl.nextRes.Header.Add(key, f.Value)
@@ -6090,7 +6091,7 @@ func (rl *http2clientConnReadLoop) onNewTrailerField(cs *http2clientStream, f hp
     return
   }
 
-  key := CanonicalHeaderKey(f.Name)
+  key := http.CanonicalHeaderKey(f.Name)
 
   // The spec says one must predeclare their trailers but in practice
   // popular users (which is to say the only user we found) do not so we
@@ -6098,7 +6099,7 @@ func (rl *http2clientConnReadLoop) onNewTrailerField(cs *http2clientStream, f hp
   const acceptAllTrailers = true
   if _, ok := (*cs.resTrailer)[key]; ok || acceptAllTrailers {
     if cs.trailer == nil {
-      cs.trailer = make(Header)
+      cs.trailer = make(http.Header)
     }
     cs.trailer[key] = append(cs.trailer[key], f.Value)
   }
@@ -6135,7 +6136,7 @@ func http2strSliceContains(ss []string, s string) bool {
 
 type http2erringRoundTripper struct{ err error }
 
-func (rt http2erringRoundTripper) RoundTrip(*Request) (*Response, error) { return nil, rt.err }
+func (rt http2erringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, rt.err }
 
 // gzipReader wraps a response body so it can lazily
 // call gzip.NewReader on the first call to Read
@@ -6278,7 +6279,7 @@ func (http2writeSettingsAck) writeFrame(ctx http2writeContext) error {
 type http2writeResHeaders struct {
   streamID    uint32
   httpResCode int      // 0 means no ":status" line
-  h           Header   // may be nil
+  h           http.Header   // may be nil
   trailers    []string // if non-nil, which keys of h to write. nil means all.
   endStream   bool
 
@@ -6379,7 +6380,7 @@ func (wu http2writeWindowUpdate) writeFrame(ctx http2writeContext) error {
   return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
 }
 
-func http2encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
+func http2encodeHeaders(enc *hpack.Encoder, h http.Header, keys []string) {
 
   if keys == nil {
     keys = make([]string, 0, len(h))
