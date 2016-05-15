@@ -11,18 +11,22 @@ package publictransport
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -30,6 +34,17 @@ import (
 type BadStringError struct {
 	what string
 	str  string
+}
+
+func (e *BadStringError) Error() string { return fmt.Sprintf("%s %q", e.what, e.str) }
+
+// Headers that Request.Write handles itself and should be skipped.
+var reqWriteExcludeHeader = map[string]bool{
+	"Host":              true, // not in Header map anyway
+	"User-Agent":        true,
+	"Content-Length":    true,
+	"Transfer-Encoding": true,
+	"Trailer":           true,
 }
 
 func ValidMethod(method string) bool {
@@ -46,7 +61,7 @@ func ValidMethod(method string) bool {
 	   extension-method = token
 	     token          = 1*<any CHAR except CTLs or separators>
 	*/
-	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+	return len(method) > 0 && strings.IndexFunc(method, IsNotToken) == -1
 }
 
 var ErrMissingHost = errors.New("http: Request.Write on Request with no Host or URL set")
@@ -67,7 +82,7 @@ func HasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastInd
 
 // This file deals with lexical matters of HTTP
 
-var isTokenTable = [127]bool{
+var IsTokenTable = [127]bool{
 	'!':  true,
 	'#':  true,
 	'$':  true,
@@ -149,11 +164,79 @@ var isTokenTable = [127]bool{
 
 func IsToken(r rune) bool {
 	i := int(r)
-	return i < len(isTokenTable) && isTokenTable[i]
+	return i < len(IsTokenTable) && IsTokenTable[i]
 }
 
 func IsNotToken(r rune) bool {
 	return !IsToken(r)
+}
+
+func IsTokenBoundary(b byte) bool {
+	return b == ' ' || b == ',' || b == '\t'
+}
+
+// hasToken reports whether token appears with v, ASCII
+// case-insensitive, with space or comma boundaries.
+// token must be all lowercase.
+// v may contain mixed cased.
+func HasToken(v, token string) bool {
+	if len(token) > len(v) || token == "" {
+		return false
+	}
+	if v == token {
+		return true
+	}
+	for sp := 0; sp <= len(v)-len(token); sp++ {
+		// Check that first character is good.
+		// The token is ASCII, so checking only a single byte
+		// is sufficient. We skip this potential starting
+		// position if both the first byte and its potential
+		// ASCII uppercase equivalent (b|0x20) don't match.
+		// False positives ('^' => '~') are caught by EqualFold.
+		if b := v[sp]; b != token[0] && b|0x20 != token[0] {
+			continue
+		}
+		// Check that start pos is on a valid token boundary.
+		if sp > 0 && !IsTokenBoundary(v[sp-1]) {
+			continue
+		}
+		// Check that end pos is on a valid token boundary.
+		if endPos := sp + len(token); endPos != len(v) && !IsTokenBoundary(v[endPos]) {
+			continue
+		}
+		if strings.EqualFold(v[sp:sp+len(token)], token) {
+			return true
+		}
+	}
+	return false
+}
+
+// Return value if nonempty, def otherwise.
+func ValueOrDefault(value, def string) string {
+	if value != "" {
+		return value
+	}
+	return def
+}
+
+// NOTE: This is not intended to reflect the actual Go version being used.
+// It was changed at the time of Go 1.1 release because the former User-Agent
+// had ended up on a blacklist for some intrusion detection systems.
+// See https://codereview.appspot.com/7532043.
+const DefaultUserAgent = "Go-http-client/1.1"
+
+func IsReplayable(r *http.Request) bool {
+	if r.Body == nil {
+		switch ValueOrDefault(r.Method, "GET") {
+		case "GET", "HEAD", "OPTIONS", "TRACE":
+			return true
+		}
+	}
+	return false
+}
+
+func ExpectsContinue(r *TransportRequest) bool {
+	return HasToken(r.Header.Get("Expect"), "100-continue")
 }
 
 // DefaultTransport is the default implementation of Transport and is
@@ -197,8 +280,8 @@ type Transport struct {
 
 	idleMu     sync.Mutex
 	wantIdle   bool // user has requested to close all idle conns
-	idleConn   map[connectMethodKey][]*persistConn
-	idleConnCh map[connectMethodKey]chan *persistConn
+	idleConn   map[ConnectMethodKey][]*PersistConn
+	idleConnCh map[ConnectMethodKey]chan *PersistConn
 
 	reqMu       sync.Mutex
 	reqCanceler map[*http.Request]func()
@@ -279,9 +362,9 @@ type Transport struct {
 	// If TLSNextProto is nil, HTTP/2 support is enabled automatically.
 	TLSNextProto map[string]func(authority string, c *tls.Conn) http.RoundTripper
 
-	// nextProtoOnce guards initialization of TLSNextProto and
+	// nextprotoonce guards initialization of TLSNextProto and
 	// h2transport (via onceSetNextProtoDefaults)
-	nextProtoOnce sync.Once
+	NextProtoOnce sync.Once
 	h2transport   *http2Transport // non-nil if http2 wired up
 
 	// TODO: tunable on global max cached connections
@@ -290,8 +373,8 @@ type Transport struct {
 }
 
 // onceSetNextProtoDefaults initializes TLSNextProto.
-// It must be called via t.nextProtoOnce.Do.
-func (t *Transport) onceSetNextProtoDefaults() {
+// It must be called via t.NextProtoOnce.Do.
+func (t *Transport) OnceSetNextProtoDefaults() {
 	if strings.Contains(os.Getenv("GODEBUG"), "http2client=0") {
 		return
 	}
@@ -379,18 +462,54 @@ func ProxyURL(fixedURL *url.URL) func(*http.Request) (*url.URL, error) {
 	}
 }
 
-// transportRequest is a wrapper around a *http.Request that adds
+// TransportRequest is a wrapper around a *http.Request that adds
 // optional extra headers to write.
-type transportRequest struct {
+type TransportRequest struct {
 	*http.Request        // original request, not to be mutated
 	extra    http.Header // extra headers to write, or nil
 }
 
-func (tr *transportRequest) extraHeaders() http.Header {
+func (tr *TransportRequest) extraHeaders() http.Header {
 	if tr.extra == nil {
 		tr.extra = make(http.Header)
 	}
 	return tr.extra
+}
+
+// CheckTransportResend checks whether a failed HTTP request can be
+// resent on a new connection. The non-nil input error is the error from
+// roundTrip, which might be wrapped in a beforeRespHeaderError error.
+//
+// The return value is either nil to retry the request, the provided
+// err unmodified, or the unwrapped error inside a
+// beforeRespHeaderError.
+func CheckTransportResend(err error, req *http.Request, pconn *PersistConn) error {
+	brhErr, ok := err.(beforeRespHeaderError)
+	if !ok {
+		return err
+	}
+	err = brhErr.error // unwrap the custom error in case we return it
+	if err != ErrMissingHost && pconn.IsReused() && IsReplayable(req) {
+		// If we try to reuse a connection that the server is in the process of
+		// closing, we may end up successfully writing out our request (or a
+		// portion of our request) only to find a connection error when we try to
+		// read from (or finish writing to) the socket.
+
+		// There can be a race between the socket pool checking whether a socket
+		// is still connected, receiving the FIN, and sending/reading data on a
+		// reused socket. If we receive the FIN between the connectedness check
+		// and writing/reading from the socket, we may first learn the socket is
+		// disconnected when we get a ERR_SOCKET_NOT_CONNECTED. This will most
+		// likely happen when trying to retrieve its IP address. See
+		// http://crbug.com/105824 for more details.
+
+		// We resend a request only if we reused a keep-alive connection and did
+		// not yet receive any header data. This automatically prevents an
+		// infinite resend loop because we'll run out of the cached keep-alive
+		// connections eventually.
+		return nil
+	}
+	return err
 }
 
 // RoundTrip implements the RoundTripper interface.
@@ -398,7 +517,7 @@ func (tr *transportRequest) extraHeaders() http.Header {
 // For higher-level HTTP client support (such as handling of cookies
 // and redirects), see Get, Post, and the Client type.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
+	t.NextProtoOnce.Do(t.OnceSetNextProtoDefaults)
 	if req.URL == nil {
 		req.Body.Close()
 		return nil, errors.New("http: nil Request.URL")
@@ -430,8 +549,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	for {
 		// treq gets modified by roundTrip, so we need to recreate for each retry.
-		treq := &transportRequest{Request: req}
-		cm, err := t.connectMethodForRequest(treq)
+		treq := &TransportRequest{Request: req}
+		cm, err := t.ConnectMethodForRequest(treq)
 		if err != nil {
 			req.Body.Close()
 			return nil, err
@@ -441,64 +560,29 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// host (for http or https), the http proxy, or the http proxy
 		// pre-CONNECTed to https server.  In any case, we'll be ready
 		// to send it requests.
-		pconn, err := t.getConn(req, cm)
+		pconn, err := t.GetConn(req, cm)
 		if err != nil {
-			t.setReqCanceler(req, nil)
+			t.SetReqCanceler(req, nil)
 			req.Body.Close()
 			return nil, err
 		}
 
 		var resp *http.Response
-		if pconn.alt != nil {
+		if pconn.Alt != nil {
 			// HTTP/2 path.
-			t.setReqCanceler(req, nil) // not cancelable with CancelRequest
-			resp, err = pconn.alt.RoundTrip(req)
+			t.SetReqCanceler(req, nil) // not cancelable with CancelRequest
+			resp, err = pconn.Alt.RoundTrip(req)
 		} else {
-			resp, err = pconn.roundTrip(treq)
+			resp, err = pconn.RoundTrip(treq)
 		}
 		if err == nil {
 			return resp, nil
 		}
-		if err := checkTransportResend(err, req, pconn); err != nil {
+		if err := CheckTransportResend(err, req, pconn); err != nil {
 			return nil, err
 		}
 		testHookRoundTripRetried()
 	}
-}
-
-// checkTransportResend checks whether a failed HTTP request can be
-// resent on a new connection. The non-nil input error is the error from
-// roundTrip, which might be wrapped in a beforeRespHeaderError error.
-//
-// The return value is err or the unwrapped error inside a
-// beforeRespHeaderError.
-func checkTransportResend(err error, req *http.Request, pconn *persistConn) error {
-	brhErr, ok := err.(beforeRespHeaderError)
-	if !ok {
-		return err
-	}
-	err = brhErr.error // unwrap the custom error in case we return it
-	if err != ErrMissingHost && pconn.isReused() && req.isReplayable() {
-		// If we try to reuse a connection that the server is in the process of
-		// closing, we may end up successfully writing out our request (or a
-		// portion of our request) only to find a connection error when we try to
-		// read from (or finish writing to) the socket.
-
-		// There can be a race between the socket pool checking whether a socket
-		// is still connected, receiving the FIN, and sending/reading data on a
-		// reused socket. If we receive the FIN between the connectedness check
-		// and writing/reading from the socket, we may first learn the socket is
-		// disconnected when we get a ERR_SOCKET_NOT_CONNECTED. This will most
-		// likely happen when trying to retrieve its IP address. See
-		// http://crbug.com/105824 for more details.
-
-		// We resend a request only if we reused a keep-alive connection and did
-		// not yet receive any header data. This automatically prevents an
-		// infinite resend loop because we'll run out of the cached keep-alive
-		// connections eventually.
-		return nil
-	}
-	return err
 }
 
 // ErrSkipAltProtocol is a sentinel error value defined by Transport.RegisterProtocol.
@@ -531,7 +615,7 @@ func (t *Transport) RegisterProtocol(scheme string, rt http.RoundTripper) {
 // a "keep-alive" state. It does not interrupt any connections currently
 // in use.
 func (t *Transport) CloseIdleConnections() {
-	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
+	t.NextProtoOnce.Do(t.OnceSetNextProtoDefaults)
 	t.idleMu.Lock()
 	m := t.idleConn
 	t.idleConn = nil
@@ -608,7 +692,7 @@ func (e *envOnce) reset() {
 	e.val = ""
 }
 
-func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectMethod, err error) {
+func (t *Transport) ConnectMethodForRequest(treq *TransportRequest) (cm ConnectMethod, err error) {
 	cm.targetScheme = treq.URL.Scheme
 	cm.targetAddr = canonicalAddr(treq.URL)
 	if t.Proxy != nil {
@@ -619,7 +703,7 @@ func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectM
 
 // proxyAuth returns the Proxy-Authorization header to set
 // on requests, if applicable.
-func (cm *connectMethod) proxyAuth() string {
+func (cm *ConnectMethod) proxyAuth() string {
 	if cm.proxyURL == nil {
 		return ""
 	}
@@ -638,11 +722,11 @@ var (
 	errWantIdle           = errors.New("http: putIdleConn: CloseIdleConnections was called")
 	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
 	errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
-	errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
+	errReadLoopExiting    = errors.New("http: PersistConn.readLoop exiting")
 	errServerClosedIdle   = errors.New("http: server closed idle conn")
 )
 
-func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
+func (t *Transport) putOrCloseIdleConn(pconn *PersistConn) {
 	if err := t.tryPutIdleConn(pconn); err != nil {
 		pconn.close(err)
 	}
@@ -653,11 +737,11 @@ func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
 // If pconn is no longer needed or not in a good state, tryPutIdleConn returns
 // an error explaining why it wasn't registered.
 // tryPutIdleConn does not close pconn. Use putOrCloseIdleConn instead for that.
-func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
+func (t *Transport) tryPutIdleConn(pconn *PersistConn) error {
 	if t.DisableKeepAlives || t.MaxIdleConnsPerHost < 0 {
 		return errKeepAlivesDisabled
 	}
-	if pconn.isBroken() {
+	if pconn.IsBroken() {
 		return errConnBroken
 	}
 	key := pconn.cacheKey
@@ -690,7 +774,7 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 		return errWantIdle
 	}
 	if t.idleConn == nil {
-		t.idleConn = make(map[connectMethodKey][]*persistConn)
+		t.idleConn = make(map[ConnectMethodKey][]*PersistConn)
 	}
 	if len(t.idleConn[key]) >= max {
 		t.idleMu.Unlock()
@@ -707,9 +791,9 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 }
 
 // getIdleConnCh returns a channel to receive and return idle
-// persistent connection for the given connectMethod.
+// persistent connection for the given ConnectMethod.
 // It may return nil, if persistent connections are not being used.
-func (t *Transport) getIdleConnCh(cm connectMethod) chan *persistConn {
+func (t *Transport) getIdleConnCh(cm ConnectMethod) chan *PersistConn {
 	if t.DisableKeepAlives {
 		return nil
 	}
@@ -718,17 +802,17 @@ func (t *Transport) getIdleConnCh(cm connectMethod) chan *persistConn {
 	defer t.idleMu.Unlock()
 	t.wantIdle = false
 	if t.idleConnCh == nil {
-		t.idleConnCh = make(map[connectMethodKey]chan *persistConn)
+		t.idleConnCh = make(map[ConnectMethodKey]chan *PersistConn)
 	}
 	ch, ok := t.idleConnCh[key]
 	if !ok {
-		ch = make(chan *persistConn)
+		ch = make(chan *PersistConn)
 		t.idleConnCh[key] = ch
 	}
 	return ch
 }
 
-func (t *Transport) getIdleConn(cm connectMethod) (pconn *persistConn) {
+func (t *Transport) getIdleConn(cm ConnectMethod) (pconn *PersistConn) {
 	key := cm.key()
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
@@ -749,13 +833,13 @@ func (t *Transport) getIdleConn(cm connectMethod) (pconn *persistConn) {
 			pconn = pconns[len(pconns)-1]
 			t.idleConn[key] = pconns[:len(pconns)-1]
 		}
-		if !pconn.isBroken() {
+		if !pconn.IsBroken() {
 			return
 		}
 	}
 }
 
-func (t *Transport) setReqCanceler(r *http.Request, fn func()) {
+func (t *Transport) SetReqCanceler(r *http.Request, fn func()) {
 	t.reqMu.Lock()
 	defer t.reqMu.Unlock()
 	if t.reqCanceler == nil {
@@ -799,20 +883,20 @@ func (t *Transport) dial(network, addr string) (net.Conn, error) {
 }
 
 // getConn dials and creates a new persistConn to the target as
-// specified in the connectMethod.  This includes doing a proxy CONNECT
+// specified in the ConnectMethod.  This includes doing a proxy CONNECT
 // and/or setting up TLS.  If this doesn't return an error, the persistConn
 // is ready to write requests to.
-func (t *Transport) getConn(req *http.Request, cm connectMethod) (*persistConn, error) {
+func (t *Transport) GetConn(req *http.Request, cm ConnectMethod) (*PersistConn, error) {
 	if pc := t.getIdleConn(cm); pc != nil {
 		// set request canceler to some non-nil function so we
 		// can detect whether it was cleared between now and when
 		// we enter roundTrip
-		t.setReqCanceler(req, func() {})
+		t.SetReqCanceler(req, func() {})
 		return pc, nil
 	}
 
 	type dialRes struct {
-		pc  *persistConn
+		pc  *PersistConn
 		err error
 	}
 	dialc := make(chan dialRes)
@@ -833,7 +917,7 @@ func (t *Transport) getConn(req *http.Request, cm connectMethod) (*persistConn, 
 	}
 
 	cancelc := make(chan struct{})
-	t.setReqCanceler(req, func() { close(cancelc) })
+	t.SetReqCanceler(req, func() { close(cancelc) })
 
 	go func() {
 		pc, err := t.dialConn(cm)
@@ -862,8 +946,8 @@ func (t *Transport) getConn(req *http.Request, cm connectMethod) (*persistConn, 
 	}
 }
 
-func (t *Transport) dialConn(cm connectMethod) (*persistConn, error) {
-	pconn := &persistConn{
+func (t *Transport) dialConn(cm ConnectMethod) (*PersistConn, error) {
+	pconn := &PersistConn{
 		t:          t,
 		cacheKey:   cm.key(),
 		reqch:      make(chan requestAndChan, 1),
@@ -909,7 +993,7 @@ func (t *Transport) dialConn(cm connectMethod) (*persistConn, error) {
 	case cm.targetScheme == "http":
 		pconn.isProxy = true
 		if pa := cm.proxyAuth(); pa != "" {
-			pconn.mutateHeaderFunc = func(h http.Header) {
+			pconn.MutateHeaderFunc = func(h http.Header) {
 				h.Set("Proxy-Authorization", pa)
 			}
 		}
@@ -981,14 +1065,14 @@ func (t *Transport) dialConn(cm connectMethod) (*persistConn, error) {
 
 	if s := pconn.tlsState; s != nil && s.NegotiatedProtocolIsMutual && s.NegotiatedProtocol != "" {
 		if next, ok := t.TLSNextProto[s.NegotiatedProtocol]; ok {
-			return &persistConn{alt: next(cm.targetAddr, pconn.conn.(*tls.Conn))}, nil
+			return &PersistConn{Alt: next(cm.targetAddr, pconn.conn.(*tls.Conn))}, nil
 		}
 	}
 
 	pconn.br = bufio.NewReader(noteEOFReader{pconn.conn, &pconn.sawEOF})
 	pconn.bw = bufio.NewWriter(pconn.conn)
-	go pconn.readLoop()
-	go pconn.writeLoop()
+	go pconn.ReadLoop()
+	go pconn.WriteLoop()
 	return pconn, nil
 }
 
@@ -1045,7 +1129,7 @@ func useProxy(addr string) bool {
 	return true
 }
 
-// connectMethod is the map key (in its String form) for keeping persistent
+// ConnectMethod is the map key (in its String form) for keeping persistent
 // TCP connections alive for subsequent HTTP requests.
 //
 // A connect method may be of the following types:
@@ -1059,13 +1143,13 @@ func useProxy(addr string) bool {
 //
 // Note: no support to https to the proxy yet.
 //
-type connectMethod struct {
+type ConnectMethod struct {
 	proxyURL     *url.URL // nil for no proxy, else full proxy URL
 	targetScheme string   // "http" or "https"
 	targetAddr   string   // Not used if proxy + http targetScheme (4th example in table)
 }
 
-func (cm *connectMethod) key() connectMethodKey {
+func (cm *ConnectMethod) key() ConnectMethodKey {
 	proxyStr := ""
 	targetAddr := cm.targetAddr
 	if cm.proxyURL != nil {
@@ -1074,7 +1158,7 @@ func (cm *connectMethod) key() connectMethodKey {
 			targetAddr = ""
 		}
 	}
-	return connectMethodKey{
+	return ConnectMethodKey{
 		proxy:  proxyStr,
 		scheme: cm.targetScheme,
 		addr:   targetAddr,
@@ -1082,7 +1166,7 @@ func (cm *connectMethod) key() connectMethodKey {
 }
 
 // addr returns the first hop "host:port" to which we need to TCP connect.
-func (cm *connectMethod) addr() string {
+func (cm *ConnectMethod) addr() string {
 	if cm.proxyURL != nil {
 		return canonicalAddr(cm.proxyURL)
 	}
@@ -1091,7 +1175,7 @@ func (cm *connectMethod) addr() string {
 
 // tlsHost returns the host name to match against the peer's
 // TLS certificate.
-func (cm *connectMethod) tlsHost() string {
+func (cm *ConnectMethod) tlsHost() string {
 	h := cm.targetAddr
 	if HasPort(h) {
 		h = h[:strings.LastIndex(h, ":")]
@@ -1099,39 +1183,39 @@ func (cm *connectMethod) tlsHost() string {
 	return h
 }
 
-// connectMethodKey is the map key version of connectMethod, with a
+// ConnectMethodKey is the map key version of ConnectMethod, with a
 // stringified proxy URL (or the empty string) instead of a pointer to
 // a URL.
-type connectMethodKey struct {
+type ConnectMethodKey struct {
 	proxy, scheme, addr string
 }
 
-func (k connectMethodKey) String() string {
+func (k ConnectMethodKey) String() string {
 	// Only used by tests.
 	return fmt.Sprintf("%s|%s|%s", k.proxy, k.scheme, k.addr)
 }
 
-// persistConn wraps a connection, usually a persistent one
+// PersistConn wraps a connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well)
-type persistConn struct {
+type PersistConn struct {
 	// alt optionally specifies the TLS NextProto RoundTripper.
 	// This is used for HTTP/2 today and future protocol laters.
 	// If it's non-nil, the rest of the fields are unused.
-	alt http.RoundTripper
+	Alt http.RoundTripper
 
 	t        *Transport
-	cacheKey connectMethodKey
+	cacheKey ConnectMethodKey
 	conn     net.Conn
 	tlsState *tls.ConnectionState
 	br       *bufio.Reader       // from conn
 	sawEOF   bool                // whether we've seen EOF from conn; owned by readLoop
 	bw       *bufio.Writer       // to conn
 	reqch    chan requestAndChan // written by roundTrip; read by readLoop
-	writech  chan writeRequest   // written by roundTrip; read by writeLoop
+	writech  chan writeRequest   // written by roundTrip; read by WriteLoop
 	closech  chan struct{}       // closed when conn closed
 	isProxy  bool
 	// writeErrCh passes the request write error (usually nil)
-	// from the writeLoop goroutine to the readLoop which passes
+	// from the WriteLoop goroutine to the readLoop which passes
 	// it off to the res.Body reader, which then uses it to decide
 	// whether or not a connection can be reused. Issue 7569.
 	writeErrCh chan error
@@ -1142,43 +1226,43 @@ type persistConn struct {
 	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
 	canceled             bool  // whether this conn was broken due a CancelRequest
 	reused               bool  // whether conn has had successful request/response and is being reused.
-	// mutateHeaderFunc is an optional func to modify extra
+	// MutateHeaderFunc is an optional func to modify extra
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
-	mutateHeaderFunc func(http.Header)
+	MutateHeaderFunc func(http.Header)
 }
 
-// isBroken reports whether this connection is in a known broken state.
-func (pc *persistConn) isBroken() bool {
+// IsBroken reports whether this connection is in a known broken state.
+func (pc *PersistConn) IsBroken() bool {
 	pc.lk.Lock()
 	b := pc.broken
 	pc.lk.Unlock()
 	return b
 }
 
-// isCanceled reports whether this connection was closed due to CancelRequest.
-func (pc *persistConn) isCanceled() bool {
+// IsCanceled reports whether this connection was closed due to CancelRequest.
+func (pc *PersistConn) IsCanceled() bool {
 	pc.lk.Lock()
 	defer pc.lk.Unlock()
 	return pc.canceled
 }
 
-// isReused reports whether this connection is in a known broken state.
-func (pc *persistConn) isReused() bool {
+// IsReused reports whether this connection is in a known broken state.
+func (pc *PersistConn) IsReused() bool {
 	pc.lk.Lock()
 	r := pc.reused
 	pc.lk.Unlock()
 	return r
 }
 
-func (pc *persistConn) cancelRequest() {
+func (pc *PersistConn) CancelRequest() {
 	pc.lk.Lock()
 	defer pc.lk.Unlock()
 	pc.canceled = true
 	pc.closeLocked(errRequestCanceled)
 }
 
-func (pc *persistConn) readLoop() {
+func (pc *PersistConn) ReadLoop() {
 	closeErr := errReadLoopExiting // default value, if not changed below
 	defer func() { pc.close(closeErr) }()
 
@@ -1228,11 +1312,11 @@ func (pc *persistConn) readLoop() {
 			// roundTrip goroutine), mark it as done now.
 			// BEFORE the send on rc.ch, as the client might re-use the
 			// same *http.Request pointer, and we don't want to set call
-			// t.setReqCanceler from this persistConn while the Transport
+			// t.SetReqCanceler from this persistConn while the Transport
 			// potentially spins up a different persistConn for the
 			// caller's subsequent request.
-			if checkTransportResend(err, rc.req, pc) != nil {
-				pc.t.setReqCanceler(rc.req, nil)
+			if CheckTransportResend(err, rc.req, pc) != nil {
+				pc.t.SetReqCanceler(rc.req, nil)
 			}
 			select {
 			case rc.ch <- responseAndError{err: err}:
@@ -1256,7 +1340,7 @@ func (pc *persistConn) readLoop() {
 		}
 
 		if !hasBody {
-			pc.t.setReqCanceler(rc.req, nil)
+			pc.t.SetReqCanceler(rc.req, nil)
 
 			// Put the idle conn back into the pool before we send the response
 			// so if they process it quickly and make another request, they'll
@@ -1297,7 +1381,7 @@ func (pc *persistConn) readLoop() {
 			waitForBodyRead <- isEOF
 			if isEOF {
 				<-eofc // see comment above eofc declaration
-			} else if err != nil && pc.isCanceled() {
+			} else if err != nil && pc.IsCanceled() {
 				return errRequestCanceled
 			}
 			return err
@@ -1314,7 +1398,7 @@ func (pc *persistConn) readLoop() {
 		// reading the response body. (or for cancelation or death)
 		select {
 		case bodyEOF := <-waitForBodyRead:
-			pc.t.setReqCanceler(rc.req, nil) // before pc might return to idle pool
+			pc.t.SetReqCanceler(rc.req, nil) // before pc might return to idle pool
 			alive = alive &&
 				bodyEOF &&
 				!pc.sawEOF &&
@@ -1343,7 +1427,7 @@ func maybeUngzipResponse(resp *http.Response) {
 	}
 }
 
-func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
+func (pc *PersistConn) readLoopPeekFailLocked(peekErr error) {
 	if pc.closed != nil {
 		return
 	}
@@ -1361,7 +1445,7 @@ func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
 
 // readResponse reads an HTTP response (or two, in the case of "Expect:
 // 100-continue") from the server. It returns the final non-100 one.
-func (pc *persistConn) readResponse(rc requestAndChan) (resp *http.Response, err error) {
+func (pc *PersistConn) readResponse(rc requestAndChan) (resp *http.Response, err error) {
 	resp, err = http.ReadResponse(pc.br, rc.req)
 	if err != nil {
 		return
@@ -1386,7 +1470,7 @@ func (pc *persistConn) readResponse(rc requestAndChan) (resp *http.Response, err
 // waitForContinue returns the function to block until
 // any response, timeout or connection close. After any of them,
 // the function returns a bool which indicates if the body should be sent.
-func (pc *persistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
+func (pc *PersistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
 	if continueCh == nil {
 		return nil
 	}
@@ -1405,15 +1489,479 @@ func (pc *persistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
 	}
 }
 
-func (pc *persistConn) writeLoop() {
+//
+//
+//
+
+// removeZone removes IPv6 zone identifier from host.
+// E.g., "[fe80::1%en0]:8080" to "[fe80::1]:8080"
+func RemoveZone(host string) string {
+	if !strings.HasPrefix(host, "[") {
+		return host
+	}
+	i := strings.LastIndex(host, "]")
+	if i < 0 {
+		return host
+	}
+	j := strings.LastIndex(host[:i], "%")
+	if j < 0 {
+		return host
+	}
+	return host[:j] + host[i:]
+}
+
+// extraHeaders may be nil
+// waitForContinue may be nil
+func Write(req *http.Request, w io.Writer, usingProxy bool, extraHeaders http.Header, waitForContinue func() bool) error {
+	// Find the target host. Prefer the Host: header, but if that
+	// is not given, use the host from the request URL.
+	//
+	// Clean the host, in case it arrives with unexpected stuff in it.
+	host := CleanHost(req.Host)
+	if host == "" {
+		if req.URL == nil {
+			return ErrMissingHost
+		}
+		host = CleanHost(req.URL.Host)
+	}
+
+	// According to RFC 6874, an HTTP client, proxy, or other
+	// intermediary must remove any IPv6 zone identifier attached
+	// to an outgoing URI.
+	host = RemoveZone(host)
+
+	ruri := req.URL.RequestURI()
+	if usingProxy && req.URL.Scheme != "" && req.URL.Opaque == "" {
+		ruri = req.URL.Scheme + "://" + host + ruri
+	} else if req.Method == "CONNECT" && req.URL.Path == "" {
+		// CONNECT requests normally give just the host and port, not a full URL.
+		ruri = host
+	}
+	// TODO(bradfitz): escape at least newlines in ruri?
+
+	// Wrap the writer in a bufio Writer if it's not already buffered.
+	// Don't always call NewWriter, as that forces a bytes.Buffer
+	// and other small bufio Writers to have a minimum 4k buffer
+	// size.
+	var bw *bufio.Writer
+	if _, ok := w.(io.ByteWriter); !ok {
+		bw = bufio.NewWriter(w)
+		w = bw
+	}
+
+	_, err := fmt.Fprintf(w, "%s %s HTTP/1.1\r\n", ValueOrDefault(req.Method, "GET"), ruri)
+	if err != nil {
+		return err
+	}
+
+	// Header lines
+	_, err = fmt.Fprintf(w, "Host: %s\r\n", host)
+	if err != nil {
+		return err
+	}
+
+	// Use the defaultUserAgent unless the Header contains one, which
+	// may be blank to not send the header.
+	userAgent := DefaultUserAgent
+	if _, ok := req.Header["User-Agent"]; ok {
+		userAgent = req.Header.Get("User-Agent")
+	}
+	if userAgent != "" {
+		_, err = fmt.Fprintf(w, "User-Agent: %s\r\n", userAgent)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Process Body,ContentLength,Close,Trailer
+	tw, err := NewTransferWriter(req)
+	if err != nil {
+		return err
+	}
+	err = tw.WriteHeader(w)
+	if err != nil {
+		return err
+	}
+
+	err = req.Header.WriteSubset(w, reqWriteExcludeHeader)
+	if err != nil {
+		return err
+	}
+
+	if extraHeaders != nil {
+		err = extraHeaders.Write(w)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = io.WriteString(w, "\r\n")
+	if err != nil {
+		return err
+	}
+
+	// Flush and wait for 100-continue if expected.
+	if waitForContinue != nil {
+		if bw, ok := w.(*bufio.Writer); ok {
+			err = bw.Flush()
+			if err != nil {
+				return err
+			}
+		}
+
+		if !waitForContinue() {
+			req.Body.Close()
+			return nil
+		}
+	}
+
+	// Write body and trailer
+	err = tw.WriteBody(w)
+	if err != nil {
+		return err
+	}
+
+	if bw != nil {
+		return bw.Flush()
+	}
+	return nil
+}
+
+// cleanHost strips anything after '/' or ' '.
+// Ideally we'd clean the Host header according to the spec:
+//   https://tools.ietf.org/html/rfc7230#section-5.4 (Host = uri-host [ ":" port ]")
+//   https://tools.ietf.org/html/rfc7230#section-2.7 (uri-host -> rfc3986's host)
+//   https://tools.ietf.org/html/rfc3986#section-3.2.2 (definition of host)
+// But practically, what we are trying to avoid is the situation in
+// issue 11206, where a malformed Host header used in the proxy context
+// would create a bad request. So it is enough to just truncate at the
+// first offending character.
+func CleanHost(in string) string {
+	if i := strings.IndexAny(in, " /"); i != -1 {
+		return in[:i]
+	}
+	return in
+}
+
+//
+//
+//
+
+// ErrLineTooLong is returned when reading request or response bodies
+// with malformed Chunked encoding.
+var ErrLineTooLong = errors.New("header line too long")
+
+// NewChunkedWriter returns a new chunkedWriter that translates writes into HTTP
+// "chunked" format before writing them to w. Closing the returned chunkedWriter
+// sends the final 0-length chunk that marks the end of the stream.
+//
+// NewChunkedWriter is not needed by normal applications. The http
+// package adds chunking automatically if handlers don't set a
+// Content-Length header. Using newChunkedWriter inside a handler
+// would result in double chunking or chunking with a Content-Length
+// length, both of which are wrong.
+func NewChunkedWriter(w io.Writer) io.WriteCloser {
+	return &ChunkedWriter{w}
+}
+
+// Writing to chunkedWriter translates to writing in HTTP chunked Transfer
+// Encoding wire format to the underlying Wire chunkedWriter.
+type ChunkedWriter struct {
+	Wire io.Writer
+}
+
+// Write the contents of data as one chunk to Wire.
+// NOTE: Note that the corresponding chunk-writing procedure in Conn.Write has
+// a bug since it does not check for success of io.WriteString
+func (cw *ChunkedWriter) Write(data []byte) (n int, err error) {
+
+	// Don't send 0-length data. It looks like EOF for chunked encoding.
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	if _, err = fmt.Fprintf(cw.Wire, "%x\r\n", len(data)); err != nil {
+		return 0, err
+	}
+	if n, err = cw.Wire.Write(data); err != nil {
+		return
+	}
+	if n != len(data) {
+		err = io.ErrShortWrite
+		return
+	}
+	if _, err = io.WriteString(cw.Wire, "\r\n"); err != nil {
+		return
+	}
+	if bw, ok := cw.Wire.(*FlushAfterChunkWriter); ok {
+		err = bw.Flush()
+	}
+	return
+}
+
+func (cw *ChunkedWriter) Close() error {
+	_, err := io.WriteString(cw.Wire, "0\r\n")
+	return err
+}
+
+// FlushAfterChunkWriter signals from the caller of NewChunkedWriter
+// that each chunk should be followed by a flush. It is used by the
+// http.Transport code to keep the buffering behavior for headers and
+// trailers, but flush out chunks aggressively in the middle for
+// request bodies which may be generated slowly. See Issue 6574.
+type FlushAfterChunkWriter struct {
+	*bufio.Writer
+}
+
+type ErrorReader struct {
+	err error
+}
+
+func (r ErrorReader) Read(p []byte) (n int, err error) {
+	return 0, r.err
+}
+
+type TransferWriter struct {
+	Method           string
+	Body             io.Reader
+	BodyCloser       io.Closer
+	ResponseToHEAD   bool
+	ContentLength    int64 // -1 means unknown, 0 means exactly none
+	Close            bool
+	TransferEncoding []string
+	Trailer          http.Header
+	IsResponse       bool
+}
+
+func NewTransferWriter(r interface{}) (t *TransferWriter, err error) {
+	t = &TransferWriter{}
+
+	// Extract relevant fields
+	atLeastHTTP11 := false
+	switch rr := r.(type) {
+	case *http.Request:
+		if rr.ContentLength != 0 && rr.Body == nil {
+			return nil, fmt.Errorf("http: Request.ContentLength=%d with nil Body", rr.ContentLength)
+		}
+		t.Method = ValueOrDefault(rr.Method, "GET")
+		t.Body = rr.Body
+		t.BodyCloser = rr.Body
+		t.ContentLength = rr.ContentLength
+		t.Close = rr.Close
+		t.TransferEncoding = rr.TransferEncoding
+		t.Trailer = rr.Trailer
+		atLeastHTTP11 = rr.ProtoAtLeast(1, 1)
+		if t.Body != nil && len(t.TransferEncoding) == 0 && atLeastHTTP11 {
+			if t.ContentLength == 0 {
+				// Test to see if it's actually zero or just unset.
+				var buf [1]byte
+				n, rerr := io.ReadFull(t.Body, buf[:])
+				if rerr != nil && rerr != io.EOF {
+					t.ContentLength = -1
+					t.Body = ErrorReader{rerr}
+				} else if n == 1 {
+					// Oh, guess there is data in this Body Reader after all.
+					// The ContentLength field just wasn't set.
+					// Stich the Body back together again, re-attaching our
+					// consumed byte.
+					t.ContentLength = -1
+					t.Body = io.MultiReader(bytes.NewReader(buf[:]), t.Body)
+				} else {
+					// Body is actually empty.
+					t.Body = nil
+					t.BodyCloser = nil
+				}
+			}
+			if t.ContentLength < 0 {
+				t.TransferEncoding = []string{"Chunked"}
+			}
+		}
+	case *http.Response:
+		t.IsResponse = true
+		if rr.Request != nil {
+			t.Method = rr.Request.Method
+		}
+		t.Body = rr.Body
+		t.BodyCloser = rr.Body
+		t.ContentLength = rr.ContentLength
+		t.Close = rr.Close
+		t.TransferEncoding = rr.TransferEncoding
+		t.Trailer = rr.Trailer
+		atLeastHTTP11 = rr.ProtoAtLeast(1, 1)
+		t.ResponseToHEAD = NoBodyExpected(t.Method)
+	}
+
+	// Sanitize Body,ContentLength,TransferEncoding
+	if t.ResponseToHEAD {
+		t.Body = nil
+		if Chunked(t.TransferEncoding) {
+			t.ContentLength = -1
+		}
+	} else {
+		if !atLeastHTTP11 || t.Body == nil {
+			t.TransferEncoding = nil
+		}
+		if Chunked(t.TransferEncoding) {
+			t.ContentLength = -1
+		} else if t.Body == nil { // no chunking, no body
+			t.ContentLength = 0
+		}
+	}
+
+	// Sanitize Trailer
+	if !Chunked(t.TransferEncoding) {
+		t.Trailer = nil
+	}
+
+	return t, nil
+}
+
+func NoBodyExpected(requestMethod string) bool {
+	return requestMethod == "HEAD"
+}
+
+func (t *TransferWriter) shouldSendContentLength() bool {
+	if Chunked(t.TransferEncoding) {
+		return false
+	}
+	if t.ContentLength > 0 {
+		return true
+	}
+	if t.ContentLength < 0 {
+		return false
+	}
+	// Many servers expect a Content-Length for these methods
+	if t.Method == "POST" || t.Method == "PUT" {
+		return true
+	}
+	if t.ContentLength == 0 && IsIdentity(t.TransferEncoding) {
+		if t.Method == "GET" || t.Method == "HEAD" {
+			return false
+		}
+		return true
+	}
+
+	return false
+}
+
+func (t *TransferWriter) WriteHeader(w io.Writer) error {
+	if t.Close {
+		if _, err := io.WriteString(w, "Connection: close\r\n"); err != nil {
+			return err
+		}
+	}
+
+	// Write Content-Length and/or Transfer-Encoding whose values are a
+	// function of the sanitized field triple (Body, ContentLength,
+	// TransferEncoding)
+	if t.shouldSendContentLength() {
+		if _, err := io.WriteString(w, "Content-Length: "); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {
+			return err
+		}
+	} else if Chunked(t.TransferEncoding) {
+		if _, err := io.WriteString(w, "Transfer-Encoding: Chunked\r\n"); err != nil {
+			return err
+		}
+	}
+
+	// Write Trailer header
+	if t.Trailer != nil {
+		keys := make([]string, 0, len(t.Trailer))
+		for k := range t.Trailer {
+			k = http.CanonicalHeaderKey(k)
+			switch k {
+			case "Transfer-Encoding", "Trailer", "Content-Length":
+				return &BadStringError{"invalid Trailer key", k}
+			}
+			keys = append(keys, k)
+		}
+		if len(keys) > 0 {
+			sort.Strings(keys)
+			// TODO: could do better allocation-wise here, but trailers are rare,
+			// so being lazy for now.
+			if _, err := io.WriteString(w, "Trailer: "+strings.Join(keys, ",")+"\r\n"); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (t *TransferWriter) WriteBody(w io.Writer) error {
+	var err error
+	var ncopy int64
+
+	// Write body
+	if t.Body != nil {
+		if Chunked(t.TransferEncoding) {
+			if bw, ok := w.(*bufio.Writer); ok && !t.IsResponse {
+				w = &FlushAfterChunkWriter{bw}
+			}
+			cw := NewChunkedWriter(w)
+			_, err = io.Copy(cw, t.Body)
+			if err == nil {
+				err = cw.Close()
+			}
+		} else if t.ContentLength == -1 {
+			ncopy, err = io.Copy(w, t.Body)
+		} else {
+			ncopy, err = io.Copy(w, io.LimitReader(t.Body, t.ContentLength))
+			if err != nil {
+				return err
+			}
+			var nextra int64
+			nextra, err = io.Copy(ioutil.Discard, t.Body)
+			ncopy += nextra
+		}
+		if err != nil {
+			return err
+		}
+		if err = t.BodyCloser.Close(); err != nil {
+			return err
+		}
+	}
+
+	if !t.ResponseToHEAD && t.ContentLength != -1 && t.ContentLength != ncopy {
+		return fmt.Errorf("http: ContentLength=%d with Body length %d",
+			t.ContentLength, ncopy)
+	}
+
+	if Chunked(t.TransferEncoding) {
+		// Write Trailer header
+		if t.Trailer != nil {
+			if err := t.Trailer.Write(w); err != nil {
+				return err
+			}
+		}
+		// Last chunk, empty trailer
+		_, err = io.WriteString(w, "\r\n")
+	}
+	return err
+}
+
+// Checks whether chunked is part of the encodings stack
+func Chunked(te []string) bool { return len(te) > 0 && te[0] == "Chunked" }
+
+// Checks whether the encoding is explicitly "identity".
+func IsIdentity(te []string) bool { return len(te) == 1 && te[0] == "identity" }
+
+//
+//
+//
+
+func (pc *PersistConn) WriteLoop() {
 	for {
 		select {
 		case wr := <-pc.writech:
-			if pc.isBroken() {
+			if pc.IsBroken() {
 				wr.ch <- errors.New("http: can't write HTTP request on broken connection")
 				continue
 			}
-			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
+			err := Write(wr.req.Request, pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
 			if err == nil {
 				err = pc.bw.Flush()
 			}
@@ -1430,15 +1978,15 @@ func (pc *persistConn) writeLoop() {
 }
 
 // wroteRequest is a check before recycling a connection that the previous write
-// (from writeLoop above) happened and was successful.
-func (pc *persistConn) wroteRequest() bool {
+// (from WriteLoop above) happened and was successful.
+func (pc *PersistConn) wroteRequest() bool {
 	select {
 	case err := <-pc.writeErrCh:
 		// Common case: the write happened well before the response, so
 		// avoid creating a timer.
 		return err == nil
 	default:
-		// Rare case: the request was written in writeLoop above but
+		// Rare case: the request was written in WriteLoop above but
 		// before it could send to pc.writeErrCh, the reader read it
 		// all, processed it, and called us here. In this case, give the
 		// write goroutine a bit of time to finish its send.
@@ -1476,22 +2024,22 @@ type requestAndChan struct {
 	// Optional blocking chan for Expect: 100-continue (for send).
 	// If the request has an "Expect: 100-continue" header and
 	// the server responds 100 Continue, readLoop send a value
-	// to writeLoop via this chan.
+	// to WriteLoop via this chan.
 	continueCh chan<- struct{}
 
 	callerGone <-chan struct{} // closed when roundTrip caller has returned
 }
 
 // A writeRequest is sent by the readLoop's goroutine to the
-// writeLoop's goroutine to write a request while the read loop
+// WriteLoop's goroutine to write a request while the read loop
 // concurrently waits on both the write response and the server's
 // reply.
 type writeRequest struct {
-	req *transportRequest
+	req *TransportRequest
 	ch  chan<- error
 
 	// Optional blocking chan for Expect: 100-continue (for recieve).
-	// If not nil, writeLoop blocks sending request body until
+	// If not nil, WriteLoop blocks sending request body until
 	// it receives from this chan.
 	continueCh <-chan struct{}
 }
@@ -1530,15 +2078,15 @@ type beforeRespHeaderError struct {
 	error
 }
 
-func (pc *persistConn) roundTrip(req *transportRequest) (resp *http.Response, err error) {
+func (pc *PersistConn) RoundTrip(req *TransportRequest) (resp *http.Response, err error) {
 	testHookEnterRoundTrip()
-	if !pc.t.replaceReqCanceler(req.Request, pc.cancelRequest) {
+	if !pc.t.replaceReqCanceler(req.Request, pc.CancelRequest) {
 		pc.t.putOrCloseIdleConn(pc)
 		return nil, errRequestCanceled
 	}
 	pc.lk.Lock()
 	pc.numExpectedResponses++
-	headerFn := pc.mutateHeaderFunc
+	headerFn := pc.MutateHeaderFunc
 	pc.lk.Unlock()
 
 	if headerFn != nil {
@@ -1571,7 +2119,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *http.Response, er
 	}
 
 	var continueCh chan struct{}
-	if req.ProtoAtLeast(1, 1) && req.Body != nil && req.expectsContinue() {
+	if req.ProtoAtLeast(1, 1) && req.Body != nil && ExpectsContinue(req) {
 		continueCh = make(chan struct{}, 1)
 	}
 
@@ -1606,7 +2154,7 @@ WaitResponse:
 		select {
 		case err := <-writeErrCh:
 			if err != nil {
-				if pc.isCanceled() {
+				if pc.IsCanceled() {
 					err = errRequestCanceled
 				}
 				re = responseAndError{err: beforeRespHeaderError{err}}
@@ -1620,7 +2168,7 @@ WaitResponse:
 			}
 		case <-pc.closech:
 			var err error
-			if pc.isCanceled() {
+			if pc.IsCanceled() {
 				err = errRequestCanceled
 			} else {
 				err = beforeRespHeaderError{fmt.Errorf("net/http: HTTP/1 transport connection broken: %v", pc.closed)}
@@ -1632,7 +2180,7 @@ WaitResponse:
 			re = responseAndError{err: errTimeout}
 			break WaitResponse
 		case re = <-resc:
-			if re.err != nil && pc.isCanceled() {
+			if re.err != nil && pc.IsCanceled() {
 				re.err = errRequestCanceled
 			}
 			break WaitResponse
@@ -1643,7 +2191,7 @@ WaitResponse:
 	}
 
 	if re.err != nil {
-		pc.t.setReqCanceler(req.Request, nil)
+		pc.t.SetReqCanceler(req.Request, nil)
 	}
 	if (re.res == nil) == (re.err == nil) {
 		panic("internal error: exactly one of res or err should be set")
@@ -1654,7 +2202,7 @@ WaitResponse:
 // markBroken marks a connection as broken (so it's not reused).
 // It differs from close in that it doesn't close the underlying
 // connection for use when it's still being read.
-func (pc *persistConn) markBroken() {
+func (pc *PersistConn) markBroken() {
 	pc.lk.Lock()
 	defer pc.lk.Unlock()
 	pc.broken = true
@@ -1662,7 +2210,7 @@ func (pc *persistConn) markBroken() {
 
 // markReused marks this connection as having been successfully used for a
 // request and response.
-func (pc *persistConn) markReused() {
+func (pc *PersistConn) markReused() {
 	pc.lk.Lock()
 	pc.reused = true
 	pc.lk.Unlock()
@@ -1673,20 +2221,20 @@ func (pc *persistConn) markReused() {
 //
 // The provided err is only for testing and debugging; in normal
 // circumstances it should never be seen by users.
-func (pc *persistConn) close(err error) {
+func (pc *PersistConn) close(err error) {
 	pc.lk.Lock()
 	defer pc.lk.Unlock()
 	pc.closeLocked(err)
 }
 
-func (pc *persistConn) closeLocked(err error) {
+func (pc *PersistConn) closeLocked(err error) {
 	if err == nil {
 		panic("nil error")
 	}
 	pc.broken = true
 	if pc.closed == nil {
 		pc.closed = err
-		if pc.alt != nil {
+		if pc.Alt != nil {
 			// Do nothing; can only get here via getConn's
 			// handlePendingDial's putOrCloseIdleConn when
 			// it turns out the abandoned connection in
@@ -1699,7 +2247,7 @@ func (pc *persistConn) closeLocked(err error) {
 			close(pc.closech)
 		}
 	}
-	pc.mutateHeaderFunc = nil
+	pc.MutateHeaderFunc = nil
 }
 
 var portMap = map[string]string{
