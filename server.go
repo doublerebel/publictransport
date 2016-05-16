@@ -931,6 +931,13 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+func (cw *chunkWriter) flush() {
+	if !cw.wroteHeader {
+		cw.WriteHeader(nil)
+	}
+	cw.res.Conn.Bufw.Flush()
+}
+
 func (cw *chunkWriter) close() {
 	if !cw.wroteHeader {
 		cw.WriteHeader(nil)
@@ -1293,6 +1300,111 @@ func (w *Response) sendExpectationFailed() {
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(StatusExpectationFailed)
 	w.finishRequest()
+}
+
+// Hijack implements the Hijacker.Hijack method. Our response is both a ResponseWriter
+// and a Hijacker.
+func (w *Response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
+	if w.handlerDone.isSet() {
+		panic("net/http: Hijack called after ServeHTTP finished")
+	}
+	if w.wroteHeader {
+		w.cw.flush()
+	}
+
+	c := w.Conn
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+
+	if w.closeNotifyCh != nil {
+		return nil, nil, errors.New("http: Hijack is incompatible with use of CloseNotifier in same ServeHTTP call")
+	}
+
+	// Release the bufioWriter that writes to the chunk writer, it is not
+	// used after a connection has been hijacked.
+	rwc, buf, err = c.HijackLocked()
+	if err == nil {
+		PutBufioWriter(w.w)
+		w.w = nil
+	}
+	return rwc, buf, err
+}
+
+func (w *Response) CloseNotify() <-chan bool {
+	if w.handlerDone.isSet() {
+		panic("net/http: CloseNotify called after ServeHTTP finished")
+	}
+	c := w.Conn
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+
+	if w.closeNotifyCh != nil {
+		return w.closeNotifyCh
+	}
+	ch := make(chan bool, 1)
+	w.closeNotifyCh = ch
+
+	if w.Conn.Hijackedv {
+		// CloseNotify is undefined after a hijack, but we have
+		// no place to return an error, so just return a channel,
+		// even though it'll never receive a value.
+		return ch
+	}
+
+	var once sync.Once
+	notify := func() { once.Do(func() { ch <- true }) }
+
+	if requestBodyRemains(w.reqBody) {
+		// They're still consuming the request body, so we
+		// shouldn't notify yet.
+		registerOnHitEOF(w.reqBody, func() {
+			c.Mu.Lock()
+			defer c.Mu.Unlock()
+			startCloseNotifyBackgroundRead(c, notify)
+		})
+	} else {
+		startCloseNotifyBackgroundRead(c, notify)
+	}
+	return ch
+}
+
+// c.mu must be held.
+func startCloseNotifyBackgroundRead(c *Conn, notify func()) {
+	if c.Bufr.Buffered() > 0 {
+		// They've consumed the request body, so anything
+		// remaining is a pipelined request, which we
+		// document as firing on.
+		notify()
+	} else {
+		c.R.startBackgroundRead(notify)
+	}
+}
+
+func registerOnHitEOF(rc io.ReadCloser, fn func()) {
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		registerOnHitEOF(v.readCloser, fn)
+	case *body:
+		v.registerOnHitEOF(fn)
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
+}
+
+// requestBodyRemains reports whether future calls to Read
+// on rc might yield more data.
+func requestBodyRemains(rc io.ReadCloser) bool {
+	if rc == eofReader {
+		return false
+	}
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		return requestBodyRemains(v.readCloser)
+	case *body:
+		return v.bodyRemains()
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
 }
 
 // A Server defines parameters for running an HTTP server.
