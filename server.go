@@ -174,7 +174,7 @@ func (srv *Server) InitialReadLimitSize() int64 {
 // wrapper around io.ReaderCloser which on first read, sends an
 // HTTP/1.1 100 Continue header
 type expectContinueReader struct {
-	resp       *response
+	resp       *Response
 	readCloser io.ReadCloser
 	closed     bool
 	sawEOF     bool
@@ -184,10 +184,10 @@ func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 	if ecr.closed {
 		return 0, http.ErrBodyReadAfterClose
 	}
-	if !ecr.resp.wroteContinue && !ecr.resp.conn.Hijacked() {
+	if !ecr.resp.wroteContinue && !ecr.resp.Conn.Hijacked() {
 		ecr.resp.wroteContinue = true
-		ecr.resp.conn.Bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
-		ecr.resp.conn.Bufw.Flush()
+		ecr.resp.Conn.Bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+		ecr.resp.Conn.Bufw.Flush()
 	}
 	n, err = ecr.readCloser.Read(p)
 	if err == io.EOF {
@@ -226,7 +226,7 @@ func appendTime(b []byte, t time.Time) []byte {
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
-func (c *Conn) ReadRequest() (w *response, err error) {
+func (c *Conn) ReadRequest() (w *Response, err error) {
 	if c.Hijacked() {
 		return nil, http.ErrHijacked
 	}
@@ -289,8 +289,8 @@ func (c *Conn) ReadRequest() (w *response, err error) {
 	}
 
 	// HERE IS WHERE WE EXPOSE THE RESPONSE/CONN
-	w = &response{
-		conn:          c,
+	w = &Response{
+		Conn:          c,
 		req:           req,
 		reqBody:       req.Body,
 		handlerHeader: make(http.Header),
@@ -310,7 +310,7 @@ func (c *Conn) ReadRequest() (w *response, err error) {
 	return w, nil
 }
 
-func (w *response) Header() http.Header {
+func (w *Response) Header() http.Header {
 	if w.cw.header == nil && w.wroteHeader && !w.cw.wroteHeader {
 		// Accessing the header between logically writing it
 		// and physically writing it means we need to allocate
@@ -332,13 +332,13 @@ func (w *response) Header() http.Header {
 // well read them)
 const maxPostHandlerReadBytes = 256 << 10
 
-func (w *response) WriteHeader(code int) {
-	if w.conn.Hijacked() {
-		w.conn.Server.Logf("http: response.WriteHeader on hijacked connection")
+func (w *Response) WriteHeader(code int) {
+	if w.Conn.Hijacked() {
+		w.Conn.Server.Logf("http: response.WriteHeader on hijacked connection")
 		return
 	}
 	if w.wroteHeader {
-		w.conn.Server.Logf("http: multiple response.WriteHeader calls")
+		w.Conn.Server.Logf("http: multiple response.WriteHeader calls")
 		return
 	}
 	w.wroteHeader = true
@@ -353,7 +353,7 @@ func (w *response) WriteHeader(code int) {
 		if err == nil && v >= 0 {
 			w.contentLength = v
 		} else {
-			w.conn.Server.Logf("http: invalid Content-Length of %q", cl)
+			w.Conn.Server.Logf("http: invalid Content-Length of %q", cl)
 			w.handlerHeader.Del("Content-Length")
 		}
 	}
@@ -409,7 +409,7 @@ func (h extraHeader) Write(w *bufio.Writer) {
 }
 
 // WriteHeader finalizes the header sent to the client and writes it
-// to cw.res.conn.Bufw.
+// to cw.res.Conn.Bufw.
 //
 // p is not written by WriteHeader, but is the first chunk of the body
 // that will be written. It is sniffed for a Content-Type if none is
@@ -423,10 +423,10 @@ func (cw *chunkWriter) WriteHeader(p []byte) {
 	cw.wroteHeader = true
 
 	w := cw.res
-	keepAlivesEnabled := w.conn.Server.DoKeepAlives()
+	keepAlivesEnabled := w.Conn.Server.DoKeepAlives()
 	isHEAD := w.req.Method == "HEAD"
 
-	// header is written out to w.conn.buf below. Depending on the
+	// header is written out to w.Conn.buf below. Depending on the
 	// state of the handler, we either own the map or not. If we
 	// don't own it, the exclude map is created lazily for
 	// WriteSubset to remove headers. The setHeader struct holds
@@ -603,7 +603,7 @@ func (cw *chunkWriter) WriteHeader(p []byte) {
 	if hasCL && hasTE && te != "identity" {
 		// TODO: return an error if WriteHeader gets a return parameter
 		// For now just ignore the Content-Length.
-		w.conn.Server.Logf("http: WriteHeader called with both Transfer-Encoding of %q and a Content-Length of %d",
+		w.Conn.Server.Logf("http: WriteHeader called with both Transfer-Encoding of %q and a Content-Length of %d",
 			te, w.contentLength)
 		delHeader("Content-Length")
 		hasCL = false
@@ -653,10 +653,10 @@ func (cw *chunkWriter) WriteHeader(p []byte) {
 		}
 	}
 
-	w.conn.Bufw.WriteString(statusLine(w.req, code))
-	cw.header.WriteSubset(w.conn.Bufw, excludeHeader)
-	setHeader.Write(w.conn.Bufw)
-	w.conn.Bufw.Write(crlf)
+	w.Conn.Bufw.WriteString(statusLine(w.req, code))
+	cw.header.WriteSubset(w.Conn.Bufw, excludeHeader)
+	setHeader.Write(w.Conn.Bufw)
+	w.Conn.Bufw.Write(crlf)
 }
 
 // foreachHeaderElement splits v according to the "#rule" construction
@@ -724,7 +724,7 @@ func statusLine(req *http.Request, code int) string {
 
 // bodyAllowed reports whether a Write is allowed for this response type.
 // It's illegal to call this before the header has been flushed.
-func (w *response) bodyAllowed() bool {
+func (w *Response) bodyAllowed() bool {
 	if !w.wroteHeader {
 		panic("")
 	}
@@ -747,8 +747,8 @@ func (w *response) bodyAllowed() bool {
 //
 // The Writers are wired together like:
 //
-// 1. *response (the ResponseWriter) ->
-// 2. (*response).w, a *bufio.Writer of bufferBeforeChunkingSize bytes
+// 1. *Response (the ResponseWriter) ->
+// 2. (*Response).w, a *bufio.Writer of bufferBeforeChunkingSize bytes
 // 3. chunkWriter.Writer (whose writeHeader finalizes Content-Length/Type)
 //    and which writes the chunk headers, if needed.
 // 4. conn.buf, a bufio.Writer of default (4kB) bytes, writing to ->
@@ -765,18 +765,18 @@ func (w *response) bodyAllowed() bool {
 // threshold and nothing is in (2).  The answer might be mostly making
 // bufferBeforeChunkingSize smaller and having bufio's fast-paths deal
 // with this instead.
-func (w *response) Write(data []byte) (n int, err error) {
+func (w *Response) Write(data []byte) (n int, err error) {
 	return w.write(len(data), data, "")
 }
 
-func (w *response) WriteString(data string) (n int, err error) {
+func (w *Response) WriteString(data string) (n int, err error) {
 	return w.write(len(data), nil, data)
 }
 
 // either dataB or dataS is non-zero.
-func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
-	if w.conn.Hijacked() {
-		w.conn.Server.Logf("http: response.Write on hijacked connection")
+func (w *Response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
+	if w.Conn.Hijacked() {
+		w.Conn.Server.Logf("http: response.Write on hijacked connection")
 		return 0, http.ErrHijacked
 	}
 	if !w.wroteHeader {
@@ -842,7 +842,7 @@ type Conn struct {
 	// on this connection, if any.
 	LastMethod string
 
-	// Mu guards Hijackedv, use of Bufr, (*response).closeNotifyCh.
+	// Mu guards Hijackedv, use of Bufr, (*Response).closeNotifyCh.
 	Mu sync.Mutex
 
 	// Hijackedv is whether this connection has been hijacked
@@ -881,9 +881,9 @@ const bufferBeforeChunkingSize = 2048
 // in cases where the handler's final output is smaller than the buffer
 // size. It also conditionally adds chunk headers, when in chunking mode.
 //
-// See the comment above (*response).Write for the entire write flow.
+// See the comment above (*Response).Write for the entire write flow.
 type chunkWriter struct {
-	res *response
+	res *Response
 
 	// header is either nil or a deep clone of res.handlerHeader
 	// at the time of res.WriteHeader, if res.WriteHeader is
@@ -892,8 +892,8 @@ type chunkWriter struct {
 	header http.Header
 
 	// wroteHeader tells whether the header's been written to "the
-	// wire" (or rather: w.conn.buf). this is unlike
-	// (*response).wroteHeader, which tells only whether it was
+	// wire" (or rather: w.Conn.buf). this is unlike
+	// (*Response).wroteHeader, which tells only whether it was
 	// logically written.
 	wroteHeader bool
 
@@ -915,18 +915,18 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 	if cw.chunking {
-		_, err = fmt.Fprintf(cw.res.conn.Bufw, "%x\r\n", len(p))
+		_, err = fmt.Fprintf(cw.res.Conn.Bufw, "%x\r\n", len(p))
 		if err != nil {
-			cw.res.conn.Rwc.Close()
+			cw.res.Conn.Rwc.Close()
 			return
 		}
 	}
-	n, err = cw.res.conn.Bufw.Write(p)
+	n, err = cw.res.Conn.Bufw.Write(p)
 	if cw.chunking && err == nil {
-		_, err = cw.res.conn.Bufw.Write(crlf)
+		_, err = cw.res.Conn.Bufw.Write(crlf)
 	}
 	if err != nil {
-		cw.res.conn.Rwc.Close()
+		cw.res.Conn.Rwc.Close()
 	}
 	return
 }
@@ -936,7 +936,7 @@ func (cw *chunkWriter) close() {
 		cw.WriteHeader(nil)
 	}
 	if cw.chunking {
-		bw := cw.res.conn.Bufw // conn's bufio writer
+		bw := cw.res.Conn.Bufw // conn's bufio writer
 		// zero chunk to mark EOF
 		bw.WriteString("0\r\n")
 		if len(cw.res.trailers) > 0 {
@@ -955,8 +955,8 @@ func (cw *chunkWriter) close() {
 }
 
 // A response represents the server side of an HTTP response.
-type response struct {
-	conn             *Conn
+type Response struct {
+	Conn             *Conn
 	req              *http.Request // request for this response
 	reqBody          io.ReadCloser
 	wroteHeader      bool               // reply header has been (logically) written
@@ -1018,7 +1018,7 @@ func (b *atomicBool) setTrue()    { atomic.StoreInt32((*int32)(b), 1) }
 // declareTrailer is called for each Trailer header when the
 // response header is written. It notes that a header will need to be
 // written in the trailers at the end of the response.
-func (w *response) declareTrailer(k string) {
+func (w *Response) declareTrailer(k string) {
 	k = http.CanonicalHeaderKey(k)
 	switch k {
 	case "Transfer-Encoding", "Content-Length", "Trailer":
@@ -1030,7 +1030,7 @@ func (w *response) declareTrailer(k string) {
 
 // requestTooLarge is called by maxBytesReader when too much input has
 // been read from the client.
-func (w *response) requestTooLarge() {
+func (w *Response) requestTooLarge() {
 	w.closeAfterReply = true
 	w.requestBodyLimitHit = true
 	if !w.wroteHeader {
@@ -1038,7 +1038,7 @@ func (w *response) requestTooLarge() {
 	}
 }
 
-func (w *response) finishRequest() {
+func (w *Response) finishRequest() {
 	w.handlerDone.setTrue()
 
 	if !w.wroteHeader {
@@ -1048,7 +1048,7 @@ func (w *response) finishRequest() {
 	w.w.Flush()
 	PutBufioWriter(w.w)
 	w.cw.close()
-	w.conn.Bufw.Flush()
+	w.Conn.Bufw.Flush()
 
 	// Close the body (regardless of w.closeAfterReply) so we can
 	// re-use its bufio.Reader later safely.
@@ -1061,7 +1061,7 @@ func (w *response) finishRequest() {
 
 // shouldReuseConnection reports whether the underlying TCP connection can be reused.
 // It must only be called after the handler is done executing.
-func (w *response) shouldReuseConnection() bool {
+func (w *Response) shouldReuseConnection() bool {
 	if w.closeAfterReply {
 		// The request or something set while executing the
 		// handler indicated we shouldn't reuse this
@@ -1076,7 +1076,7 @@ func (w *response) shouldReuseConnection() bool {
 
 	// There was some error writing to the underlying connection
 	// during the request, so don't re-use this conn.
-	if w.conn.Werr != nil {
+	if w.Conn.Werr != nil {
 		return false
 	}
 
@@ -1087,7 +1087,7 @@ func (w *response) shouldReuseConnection() bool {
 	return true
 }
 
-func (w *response) closedRequestBodyEarly() bool {
+func (w *Response) closedRequestBodyEarly() bool {
 	body, ok := w.req.Body.(*body)
 	return ok && body.didEarlyClose()
 }
@@ -1277,7 +1277,7 @@ func (c *Conn) Serve() {
 	}
 }
 
-func (w *response) sendExpectationFailed() {
+func (w *Response) sendExpectationFailed() {
 	// TODO(bradfitz): let ServeHTTP handlers handle
 	// requests with non-standard expectation[s]? Seems
 	// theoretical at best, and doesn't fit into the
