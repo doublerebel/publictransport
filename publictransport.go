@@ -31,13 +31,6 @@ import (
 	"time"
 )
 
-type BadStringError struct {
-	what string
-	str  string
-}
-
-func (e *BadStringError) Error() string { return fmt.Sprintf("%s %q", e.what, e.str) }
-
 // Headers that Request.Write handles itself and should be skipped.
 var reqWriteExcludeHeader = map[string]bool{
 	"Host":              true, // not in Header map anyway
@@ -80,137 +73,6 @@ func BasicAuth(username, password string) string {
 // return true if the string includes a port.
 func HasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastIndex(s, "]") }
 
-// This file deals with lexical matters of HTTP
-
-var IsTokenTable = [127]bool{
-	'!':  true,
-	'#':  true,
-	'$':  true,
-	'%':  true,
-	'&':  true,
-	'\'': true,
-	'*':  true,
-	'+':  true,
-	'-':  true,
-	'.':  true,
-	'0':  true,
-	'1':  true,
-	'2':  true,
-	'3':  true,
-	'4':  true,
-	'5':  true,
-	'6':  true,
-	'7':  true,
-	'8':  true,
-	'9':  true,
-	'A':  true,
-	'B':  true,
-	'C':  true,
-	'D':  true,
-	'E':  true,
-	'F':  true,
-	'G':  true,
-	'H':  true,
-	'I':  true,
-	'J':  true,
-	'K':  true,
-	'L':  true,
-	'M':  true,
-	'N':  true,
-	'O':  true,
-	'P':  true,
-	'Q':  true,
-	'R':  true,
-	'S':  true,
-	'T':  true,
-	'U':  true,
-	'W':  true,
-	'V':  true,
-	'X':  true,
-	'Y':  true,
-	'Z':  true,
-	'^':  true,
-	'_':  true,
-	'`':  true,
-	'a':  true,
-	'b':  true,
-	'c':  true,
-	'd':  true,
-	'e':  true,
-	'f':  true,
-	'g':  true,
-	'h':  true,
-	'i':  true,
-	'j':  true,
-	'k':  true,
-	'l':  true,
-	'm':  true,
-	'n':  true,
-	'o':  true,
-	'p':  true,
-	'q':  true,
-	'r':  true,
-	's':  true,
-	't':  true,
-	'u':  true,
-	'v':  true,
-	'w':  true,
-	'x':  true,
-	'y':  true,
-	'z':  true,
-	'|':  true,
-	'~':  true,
-}
-
-func IsToken(r rune) bool {
-	i := int(r)
-	return i < len(IsTokenTable) && IsTokenTable[i]
-}
-
-func IsNotToken(r rune) bool {
-	return !IsToken(r)
-}
-
-func IsTokenBoundary(b byte) bool {
-	return b == ' ' || b == ',' || b == '\t'
-}
-
-// hasToken reports whether token appears with v, ASCII
-// case-insensitive, with space or comma boundaries.
-// token must be all lowercase.
-// v may contain mixed cased.
-func HasToken(v, token string) bool {
-	if len(token) > len(v) || token == "" {
-		return false
-	}
-	if v == token {
-		return true
-	}
-	for sp := 0; sp <= len(v)-len(token); sp++ {
-		// Check that first character is good.
-		// The token is ASCII, so checking only a single byte
-		// is sufficient. We skip this potential starting
-		// position if both the first byte and its potential
-		// ASCII uppercase equivalent (b|0x20) don't match.
-		// False positives ('^' => '~') are caught by EqualFold.
-		if b := v[sp]; b != token[0] && b|0x20 != token[0] {
-			continue
-		}
-		// Check that start pos is on a valid token boundary.
-		if sp > 0 && !IsTokenBoundary(v[sp-1]) {
-			continue
-		}
-		// Check that end pos is on a valid token boundary.
-		if endPos := sp + len(token); endPos != len(v) && !IsTokenBoundary(v[endPos]) {
-			continue
-		}
-		if strings.EqualFold(v[sp:sp+len(token)], token) {
-			return true
-		}
-	}
-	return false
-}
-
 // Return value if nonempty, def otherwise.
 func ValueOrDefault(value, def string) string {
 	if value != "" {
@@ -224,20 +86,6 @@ func ValueOrDefault(value, def string) string {
 // had ended up on a blacklist for some intrusion detection systems.
 // See https://codereview.appspot.com/7532043.
 const DefaultUserAgent = "Go-http-client/1.1"
-
-func IsReplayable(r *http.Request) bool {
-	if r.Body == nil {
-		switch ValueOrDefault(r.Method, "GET") {
-		case "GET", "HEAD", "OPTIONS", "TRACE":
-			return true
-		}
-	}
-	return false
-}
-
-func ExpectsContinue(r *TransportRequest) bool {
-	return HasToken(r.Header.Get("Expect"), "100-continue")
-}
 
 // DefaultTransport is the default implementation of Transport and is
 // used by DefaultClient. It establishes network connections as needed
@@ -2119,7 +1967,7 @@ func (pc *PersistConn) RoundTrip(req *TransportRequest) (resp *http.Response, er
 	}
 
 	var continueCh chan struct{}
-	if req.ProtoAtLeast(1, 1) && req.Body != nil && ExpectsContinue(req) {
+	if req.ProtoAtLeast(1, 1) && req.Body != nil && ExpectsContinue(req.Request) {
 		continueCh = make(chan struct{}, 1)
 	}
 
