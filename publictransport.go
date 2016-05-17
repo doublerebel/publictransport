@@ -270,11 +270,11 @@ func (tr *transportRequest) extraHeaders() http.Header {
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	if req.URL == nil {
-		req.closeBody()
+		req.Body.Close()
 		return nil, errors.New("http: nil Request.URL")
 	}
 	if req.Header == nil {
-		req.closeBody()
+		req.Body.Close()
 		return nil, errors.New("http: nil Request.Header")
 	}
 	// TODO(bradfitz): switch to atomic.Value for this map instead of RWMutex
@@ -287,14 +287,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	if s := req.URL.Scheme; s != "http" && s != "https" {
-		req.closeBody()
+		req.Body.Close()
 		return nil, &badStringError{"unsupported protocol scheme", s}
 	}
 	if req.Method != "" && !validMethod(req.Method) {
 		return nil, fmt.Errorf("net/http: invalid method %q", req.Method)
 	}
 	if req.URL.Host == "" {
-		req.closeBody()
+		req.Body.Close()
 		return nil, errors.New("http: no Host in request URL")
 	}
 
@@ -303,7 +303,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		treq := &transportRequest{Request: req}
 		cm, err := t.connectMethodForRequest(treq)
 		if err != nil {
-			req.closeBody()
+			req.Body.Close()
 			return nil, err
 		}
 
@@ -314,7 +314,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		pconn, err := t.getConn(req, cm)
 		if err != nil {
 			t.setReqCanceler(req, nil)
-			req.closeBody()
+			req.Body.Close()
 			return nil, err
 		}
 
@@ -1289,7 +1289,7 @@ func (pc *persistConn) writeLoop() {
 			}
 			if err != nil {
 				pc.markBroken()
-				wr.req.Request.closeBody()
+				wr.req.Request.Body.Close()
 			}
 			pc.writeErrCh <- err // to the body reader, which might recycle us
 			wr.ch <- err         // to the roundTrip function
