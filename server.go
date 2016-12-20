@@ -1099,6 +1099,13 @@ func (w *Response) closedRequestBodyEarly() bool {
 	return ok && body.didEarlyClose()
 }
 
+func (w *Response) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(StatusOK)
+	}
+	w.w.Flush()
+	w.cw.flush()
+}
 
 func (c *Conn) FinalFlush() {
 	if c.Bufr != nil {
